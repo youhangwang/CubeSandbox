@@ -12,6 +12,10 @@ If you are *using* CubeSandbox (deploying it, building templates, calling the AP
 
 - [CubeTemplateCenter Design](./templatecenter-design) — the standalone template build service: control/data plane split, routing rules, callback authentication, artifact lifecycle, deployment wiring, and known limitations.
 
+## Feature designs
+
+- [Template Memory Hotset Profile & Restore Prewarm](./sandbox-template-profile-prewarm) — before a template build finishes, two verification restores measure exactly which memory pages a cold start must load; that list ships with the template as a profile, and every sandbox started from the template pre-reads those regions into the page cache, so first-touch faults hit memory instead of stalling on the disk. The page covers how the profile is produced and formatted, how the consumer validates it, the fail-only-degrade guarantees, and the configuration switches.
+
 ## What belongs here
 
 - Cross-service data contracts and naming conventions (keys, topics, schemas)
