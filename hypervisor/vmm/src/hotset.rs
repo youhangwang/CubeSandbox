@@ -4,21 +4,27 @@
 //
 // Consumer side of the template memory hotset profile ("hot-pages.json").
 //
-// At template-build time the set of memory pages a restored guest touches
-// between resume and ready is profiled from /proc/<pid>/pagemap over two
-// verification restores (see Cubelet's AppSnapshot profiling phase); their
-// intersection is written as an extent list into the template snapshot state
-// dir (next to the `memory-ranges` file). Here, at fast-restore time, we read
-// the profile and issue posix_fadvise(WILLNEED) per extent so guest
-// first-touch faults hit page cache instead of stalling on disk reads.
+// At template-build time Cubelet records the memory pages a restored guest
+// touches between resume and ready, and writes the extent list into the
+// template snapshot state dir (next to the `memory-ranges` file). Here, at
+// fast-restore time, we read the profile and pread(2) each extent into the
+// page cache from a bounded worker pool, so guest first-touch faults hit
+// cache instead of disk. pread is used rather than a readahead hint
+// (fadvise/madvise) so delivery is complete on every kernel. Workers pull
+// chunk-sized units from a shared queue and are cancelled when the VM goes
+// away.
 //
 // The profile is a pure optimization. Any absence, corruption, validation
-// failure or fadvise error downgrades to the plain restore path — restore
+// failure or pread error downgrades to the plain restore path — restore
 // must never fail or slow down measurably because of profiling.
 
 use std::fs::{self, File};
+use std::io;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use serde::Deserialize;
 
@@ -30,6 +36,39 @@ const SUPPORTED_VERSION: u32 = 1;
 /// (sweeping the whole file competes with concurrent guest faults).
 const MAX_TOTAL_RATIO_NUM: u64 = 1;
 const MAX_TOTAL_RATIO_DEN: u64 = 2;
+/// Per-pread chunk: also the work unit handed to the workers, so a giant
+/// extent cannot serialize behind one thread.
+const PREAD_CHUNK_BYTES: usize = 1 << 20;
+/// Worker threads when `CUBE_VMM_RESTORE_HOTSET_QD` is unset or unparsable.
+const DEFAULT_WORKERS: usize = 8;
+const MAX_WORKERS: usize = 64;
+/// Number of prewarm worker threads; 1 restores the sequential behavior.
+const ENV_HOTSET_WORKERS: &str = "CUBE_VMM_RESTORE_HOTSET_QD";
+
+fn worker_count() -> usize {
+    match std::env::var(ENV_HOTSET_WORKERS) {
+        Ok(v) => v
+            .trim()
+            .parse::<usize>()
+            .map(|n| n.clamp(1, MAX_WORKERS))
+            .unwrap_or(DEFAULT_WORKERS),
+        Err(_) => DEFAULT_WORKERS,
+    }
+}
+
+/// Cancels the prewarm workers: set when the VM owning the restored memory
+/// goes away (MemoryManager teardown, failed restore setup), so a short-lived
+/// guest — e.g. the template-build verification sandboxes — does not keep
+/// workers reading a memory volume nobody maps anymore.
+pub struct PrewarmGuard {
+    cancel: Arc<AtomicBool>,
+}
+
+impl PrewarmGuard {
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
 
 /// `CUBE_VMM_RESTORE_HOTSET_DISABLE`: consume nothing, behave exactly like
 /// the plain restore path.
@@ -95,29 +134,200 @@ fn validate(profile: &HotPagesProfile, actual_size: u64) -> Result<(), String> {
     Ok(())
 }
 
-fn advise_willneed(memory_file: &File, offset: u64, len: u64) -> i32 {
-    // SAFETY: plain fadvise on an owned fd; kernel-only side effects.
-    unsafe {
-        libc::posix_fadvise(
-            memory_file.as_raw_fd(),
-            offset as libc::off_t,
-            len as libc::off_t,
-            libc::POSIX_FADV_WILLNEED,
-        )
+/// One pread64, retried on EINTR and short reads. `Ok(bytes)` with
+/// `bytes < buf.len()` means EOF was reached mid-request.
+fn pread_once(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        // SAFETY: plain pread64 into a caller-owned buffer of the matching
+        // length; kernel-only side effects.
+        let n = unsafe {
+            libc::pread64(
+                file.as_raw_fd(),
+                buf[filled..].as_mut_ptr().cast(),
+                buf.len() - filled,
+                offset.saturating_add(filled as u64) as libc::off64_t,
+            )
+        };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        if n == 0 {
+            break; // EOF
+        }
+        filled += n as usize;
+    }
+    Ok(filled)
+}
+
+/// Split extents into chunk-sized work units. Extents stay the unit of the
+/// profile (and of validation); chunks are only the workers' queue items.
+fn split_chunks(extents: &[[u64; 2]]) -> Vec<[u64; 2]> {
+    let mut chunks = Vec::new();
+    for &[offset, len] in extents {
+        let mut pos = offset;
+        let mut left = len;
+        while left > 0 {
+            let n = (left as usize).min(PREAD_CHUNK_BYTES) as u64;
+            chunks.push([pos, n]);
+            pos += n;
+            left -= n;
+        }
+    }
+    chunks
+}
+
+/// Run the prewarm walk on a pool of worker threads pulling chunk-sized work
+/// units from a shared queue. Returns the cancel guard and the coordinator's
+/// join handle (dropped by the caller; joined by tests). The coordinator
+/// joins the workers and logs the aggregate outcome, so the caller stays
+/// fire-and-forget.
+fn spawn_prewarm(
+    file: File,
+    extents: Vec<[u64; 2]>,
+    total: u64,
+) -> io::Result<(PrewarmGuard, std::thread::JoinHandle<()>)> {
+    let chunks = Arc::new(split_chunks(&extents));
+    let nchunks = chunks.len();
+    let next = Arc::new(AtomicUsize::new(0));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicU64::new(0));
+    let incomplete = Arc::new(AtomicBool::new(false));
+
+    let mut joins = Vec::new();
+    for i in 0..worker_count() {
+        let Ok(worker_file) = file.try_clone() else {
+            let e = io::Error::last_os_error();
+            if joins.is_empty() {
+                return Err(e);
+            }
+            debug!("restore memory hotset: worker {i} fd clone failed: {e}");
+            break;
+        };
+        let worker = {
+            let chunks = Arc::clone(&chunks);
+            let next = Arc::clone(&next);
+            let cancel = Arc::clone(&cancel);
+            let done = Arc::clone(&done);
+            let incomplete = Arc::clone(&incomplete);
+            move || {
+                let mut scratch = vec![0u8; PREAD_CHUNK_BYTES];
+                loop {
+                    if cancel.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let idx = next.fetch_add(1, Ordering::Relaxed);
+                    if idx >= chunks.len() {
+                        return;
+                    }
+                    let [off, len] = chunks[idx];
+                    let mut pos = off;
+                    let mut left = len;
+                    while left > 0 {
+                        if cancel.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let want = (left as usize).min(scratch.len());
+                        match pread_once(&worker_file, pos, &mut scratch[..want]) {
+                            Ok(n) if n == want => {
+                                done.fetch_add(n as u64, Ordering::Relaxed);
+                                pos += n as u64;
+                                left -= n as u64;
+                            }
+                            Ok(_) => {
+                                // EOF (should not happen: validate() bounds
+                                // extents by the file size). Give up; the
+                                // plain fault path covers the rest.
+                                incomplete.store(true, Ordering::Relaxed);
+                                return;
+                            }
+                            Err(e) => {
+                                debug!("restore memory hotset: pread at {pos} failed: {e}");
+                                incomplete.store(true, Ordering::Relaxed);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        match std::thread::Builder::new()
+            .name(format!("hotset-prewarm{i}"))
+            .spawn(worker)
+        {
+            Ok(join) => joins.push(join),
+            Err(e) => {
+                if joins.is_empty() {
+                    return Err(e);
+                }
+                debug!("restore memory hotset: worker {i} spawn failed: {e}");
+                break;
+            }
+        }
+    }
+
+    let coord_cancel = Arc::clone(&cancel);
+    let coord_done = Arc::clone(&done);
+    let coord_incomplete = Arc::clone(&incomplete);
+    let coordinator = std::thread::Builder::new()
+        .name("hotset-prewarm".to_string())
+        .spawn(move || {
+            let started = std::time::Instant::now();
+            for join in joins {
+                let _ = join.join();
+            }
+            let got = coord_done.load(Ordering::Relaxed);
+            let ms = started.elapsed().as_millis();
+            if coord_incomplete.load(Ordering::Relaxed) {
+                warn!(
+                    "restore memory hotset prewarm incomplete: {got} of {total} bytes in {nchunks} chunks, {ms} ms"
+                );
+            } else if coord_cancel.load(Ordering::Relaxed) {
+                debug!(
+                    "restore memory hotset prewarm cancelled after {got} of {total} bytes, {ms} ms"
+                );
+            } else {
+                info!(
+                    "restore memory hotset prewarm done: {got} bytes in {nchunks} chunks, {ms} ms"
+                );
+            }
+        })?;
+
+    Ok((PrewarmGuard { cancel }, coordinator))
+}
+
+/// Size of the opened memory target: `metadata().len()` for regular files,
+/// lseek(SEEK_END) for block devices, whose st_size is always 0. lseek is
+/// already on the VMM seccomp allowlist; a BLKGETSIZE64 ioctl is not.
+fn memory_target_size(file: &File, meta: &fs::Metadata) -> u64 {
+    if !meta.file_type().is_block_device() {
+        return meta.len();
+    }
+    // SAFETY: plain lseek on an owned fd, no pointer arguments.
+    let end = unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_END) };
+    if end > 0 {
+        end as u64
+    } else {
+        0
     }
 }
 
-/// Kick async prewarm for the guest memory hotset, if a valid profile exists
-/// in `snapshot_dir` (the snapshot state dir the restore reads VM state from).
-/// `memory_file` is the already-open memory file (volume) whose size the
-/// profile is validated against.
+/// Kick page-cache prewarm for the guest memory hotset, if a valid profile
+/// exists in `snapshot_dir` (the snapshot state dir the restore reads VM state
+/// from). `memory_file` is the already-open memory file (volume) whose size
+/// the profile is validated against.
 ///
-/// Fire-and-forget: fadvise is asynchronous, all failures are logged at
+/// Returns a guard cancelling the workers; the caller ties it to the restored
+/// VM's lifetime. Fire-and-forget otherwise: failures are logged at
 /// debug/warn and never propagated.
-pub fn restore_prewarm(memory_file: &File, snapshot_dir: &Path) {
+pub fn restore_prewarm(memory_file: &File, snapshot_dir: &Path) -> Option<PrewarmGuard> {
     if disabled() {
         debug!("restore memory hotset prewarm disabled");
-        return;
+        return None;
     }
     let profile_path = profile_path_for(snapshot_dir);
 
@@ -125,7 +335,7 @@ pub fn restore_prewarm(memory_file: &File, snapshot_dir: &Path) {
         Ok(m) => m,
         Err(e) => {
             debug!("restore memory hotset: memory file metadata failed: {e}");
-            return;
+            return None;
         }
     };
 
@@ -136,52 +346,58 @@ pub fn restore_prewarm(memory_file: &File, snapshot_dir: &Path) {
             "restore memory hotset: no profile at {}: {e}",
             profile_path.display()
         );
-        return;
+        return None;
     }
 
     let content = match fs::read_to_string(&profile_path) {
         Ok(c) => c,
         Err(e) => {
             debug!("restore memory hotset: profile unreadable: {e}");
-            return;
+            return None;
         }
     };
     let profile: HotPagesProfile = match serde_json::from_str(&content) {
         Ok(p) => p,
         Err(e) => {
             debug!("restore memory hotset: profile corrupt: {e}");
-            return;
+            return None;
         }
     };
 
-    if let Err(reason) = validate(&profile, memory_meta.len()) {
-        debug!(
+    if let Err(reason) = validate(&profile, memory_target_size(&memory_file, &memory_meta)) {
+        warn!(
             "restore memory hotset: profile rejected ({}): {reason}",
             profile_path.display()
         );
-        return;
+        return None;
+    }
+
+    if profile.extents.is_empty() {
+        debug!("restore memory hotset: empty profile, nothing to warm");
+        return None;
     }
 
     let total: u64 = profile.extents.iter().map(|e| e[1]).sum();
-    let mut skipped = 0usize;
-    for extent in &profile.extents {
-        if advise_willneed(memory_file, extent[0], extent[1]) != 0 {
-            skipped += 1;
+    let worker_file = match memory_file.try_clone() {
+        Ok(f) => f,
+        Err(e) => {
+            debug!("restore memory hotset: cannot clone memory fd: {e}");
+            return None;
         }
-    }
-    if skipped == 0 {
-        info!(
-            "restore memory hotset prewarm kicked: {} extents, {} bytes",
-            profile.extents.len(),
-            total
-        );
-    } else {
-        warn!(
-            "restore memory hotset prewarm partial: {} extents, {} bytes, {} fadvise failed",
-            profile.extents.len(),
-            total,
-            skipped
-        );
+    };
+    match spawn_prewarm(worker_file, profile.extents.clone(), total) {
+        Ok((guard, _coordinator)) => {
+            info!(
+                "restore memory hotset prewarm kicked: {} extents, {} workers, {total} bytes",
+                profile.extents.len(),
+                worker_count()
+            );
+            Some(guard)
+        }
+        Err(e) => {
+            debug!("restore memory hotset: cannot spawn prewarm workers: {e}");
+            None
+        }
     }
 }
 
@@ -248,6 +464,15 @@ mod tests {
         assert_eq!(validate(&p, half), Ok(()));
     }
 
+    #[test]
+    fn test_memory_target_size_regular_file_is_st_size() {
+        let _g = LOCK.lock().unwrap();
+        let dir = temp_dir_case("size");
+        let mem = write_file(&dir.join("mem.bin"), &vec![0u8; 12345]);
+        assert_eq!(memory_target_size(&mem, &mem.metadata().unwrap()), 12345);
+        fs::remove_dir_all(&dir).ok();
+    }
+
     fn temp_dir_case(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "vmm-hotset-{tag}-{}",
@@ -293,6 +518,63 @@ mod tests {
         let profile_path = profile_path_for(&dir);
         fs::write(&profile_path, r#"{"version":1,"template_id":"t","mem_file_size":1048576,"profiled_at":"x","extents":[[0,4096],[8192,4096]]}"#).unwrap();
         restore_prewarm(&mem, &dir);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_split_chunks_covers_all_bytes() {
+        let extents = vec![[0, 2 * PREAD_CHUNK_BYTES as u64 + 123], [10 << 20, 4096]];
+        let chunks = split_chunks(&extents);
+        let total: u64 = extents.iter().map(|e| e[1]).sum();
+        assert_eq!(chunks.iter().map(|c| c[1]).sum::<u64>(), total);
+        assert!(chunks.iter().all(|c| c[1] <= PREAD_CHUNK_BYTES as u64));
+        // chunk count: 3 from the split extent + 1 small one
+        assert_eq!(chunks.len(), 4);
+        // contiguity within each source extent
+        assert_eq!(chunks[0][0] + chunks[0][1], chunks[1][0]);
+        assert_eq!(chunks[1][0] + chunks[1][1], chunks[2][0]);
+    }
+
+    #[test]
+    fn test_worker_count_env_clamped() {
+        let _g = LOCK.lock().unwrap();
+        for (raw, want) in [("0", 1), ("1", 1), ("8", 8), ("999", MAX_WORKERS)] {
+            std::env::set_var(ENV_HOTSET_WORKERS, raw);
+            assert_eq!(worker_count(), want, "env {raw}");
+        }
+        std::env::set_var(ENV_HOTSET_WORKERS, "notanumber");
+        assert_eq!(worker_count(), DEFAULT_WORKERS);
+        std::env::remove_var(ENV_HOTSET_WORKERS);
+        assert_eq!(worker_count(), DEFAULT_WORKERS);
+    }
+
+    #[test]
+    fn test_spawn_prewarm_walks_whole_profile() {
+        let _g = LOCK.lock().unwrap();
+        let dir = temp_dir_case("spawn");
+        let mem = write_file(&dir.join("mem.bin"), &vec![0u8; 1 << 20]);
+        let (guard, coordinator) =
+            spawn_prewarm(mem.try_clone().unwrap(), vec![[0, 1 << 20]], 1 << 20).unwrap();
+        coordinator.join().unwrap();
+        assert!(!guard.cancel.load(Ordering::Relaxed));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_spawn_prewarm_cancel_stops_the_walk() {
+        let _g = LOCK.lock().unwrap();
+        let dir = temp_dir_case("spawn-cancel");
+        // 64 MiB, 64 chunks: far more than a worker can finish before the
+        // cancel lands on the next scheduling quantum
+        let mem = write_file(&dir.join("mem.bin"), &vec![0u8; 64 << 20]);
+        let (guard, coordinator) = spawn_prewarm(
+            mem.try_clone().unwrap(),
+            vec![[0, 64 << 20]],
+            64 << 20,
+        )
+        .unwrap();
+        guard.cancel();
+        coordinator.join().unwrap();
         fs::remove_dir_all(&dir).ok();
     }
 
