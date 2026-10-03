@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
@@ -64,6 +65,10 @@ const (
 	// hotPagesMaxTotalDen caps the profile extent total at 1/N of the memory
 	// volume — the consumer rejects anything larger.
 	hotPagesMaxTotalDen = 2
+	// hotPagesMaxExtents caps how many extents a profile may carry. Past
+	// this point the profile costs more than it saves, and the phase fails
+	// open: the template publishes without a profile.
+	hotPagesMaxExtents = 4096
 	// extentCoalescePages merges hot pages separated by small gaps so the
 	// extent list stays short.
 	extentCoalescePages = 16
@@ -120,12 +125,8 @@ func (s *service) runTemplateProfilePhase(
 		return errors.New("empty page intersection across rounds")
 	}
 	extents, totalBytes := mergeHotExtents(pages, extentCoalescePages, memFileSize)
-	if totalBytes == 0 {
-		return errors.New("merged profile is empty")
-	}
-	if totalBytes*hotPagesMaxTotalDen > memFileSize {
-		return fmt.Errorf("profile total %d bytes exceeds 1/%d of memory size %d",
-			totalBytes, hotPagesMaxTotalDen, memFileSize)
+	if err := checkHotProfileCaps(extents, totalBytes, memFileSize); err != nil {
+		return err
 	}
 	if err := writeHotPagesFile(profilePath, templateID, memFileSize, extents); err != nil {
 		return fmt.Errorf("write profile: %w", err)
@@ -139,7 +140,8 @@ func (s *service) runTemplateProfilePhase(
 // profileVerificationRound starts one verification sandbox from the new
 // template through the normal create path, waits for it to become ready
 // (Create returns), collects the touched page set from the VMM process and
-// destroys the sandbox. Errors leave no sandbox behind.
+// destroys the sandbox best-effort on every path: Create is not atomic, and
+// a failed create can still leave the sandbox behind.
 func (s *service) profileVerificationRound(
 	ctx context.Context,
 	stepLog *log.CubeWrapperLogEntry,
@@ -153,7 +155,9 @@ func (s *service) profileVerificationRound(
 		return nil, err
 	}
 
-	verifyCtx, cancel := context.WithTimeout(context.Background(), budget)
+	// Derived from the incoming ctx, so an aborted build also aborts the
+	// round; budget is the round's share of the phase deadline.
+	verifyCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	verifyCtx = inheritIncomingMetadata(verifyCtx, ctx)
 	verifyCtx = CubeLog.WithRequestTrace(verifyCtx, &CubeLog.RequestTrace{
@@ -170,32 +174,45 @@ func (s *service) profileVerificationRound(
 		"sandboxID": verifyReq.GetAnnotations()[constants.MasterAnnotationDesiredSandboxID],
 	})
 
-	createRsp, err := s.Create(verifyCtx, verifyReq)
-	if err != nil {
-		return nil, fmt.Errorf("create verification sandbox: %w", err)
-	}
-	if !ret.IsSuccessCode(createRsp.GetRet().GetRetCode()) {
-		return nil, fmt.Errorf("create verification sandbox: %s", createRsp.GetRet().GetRetMsg())
+	createRsp, createErr := s.Create(verifyCtx, verifyReq)
+	if createErr == nil && createRsp == nil {
+		// A nil response would read as ret code 0 (= ErrorCode_OK) below.
+		createErr = errors.New("create verification sandbox returned no response")
 	}
 	sandboxID := createRsp.GetSandboxID()
+	if sandboxID == "" {
+		sandboxID = verifyReq.GetAnnotations()[constants.MasterAnnotationDesiredSandboxID]
+	}
+	destroyRoundSandbox := func() {
+		// Deliberately on context.Background(): a cancelled build must
+		// still reap the sandbox.
+		destroyCtx, destroyCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer destroyCancel()
+		destroyCtx = inheritIncomingMetadata(destroyCtx, ctx)
+		destroyCtx = namespaces.WithNamespace(destroyCtx, namespaces.Default)
+		destroyRsp, destroyErr := s.Destroy(destroyCtx, &cubebox.DestroyCubeSandboxRequest{
+			RequestID: verifyReq.GetRequestID(),
+			SandboxID: sandboxID,
+		})
+		switch {
+		case destroyErr != nil:
+			roundLog.Warnf("verification sandbox %s destroy failed: %v", sandboxID, destroyErr)
+		case !ret.IsSuccessCode(destroyRsp.GetRet().GetRetCode()):
+			roundLog.Warnf("verification sandbox %s destroy failed: %s", sandboxID, destroyRsp.GetRet().GetRetMsg())
+		}
+	}
+	if createErr != nil || !ret.IsSuccessCode(createRsp.GetRet().GetRetCode()) {
+		destroyRoundSandbox()
+		if createErr != nil {
+			return nil, fmt.Errorf("create verification sandbox: %w", createErr)
+		}
+		return nil, fmt.Errorf("create verification sandbox: %s", createRsp.GetRet().GetRetMsg())
+	}
 	roundLog.Infof("verification sandbox created: %s", sandboxID)
 
 	// Always destroy the verification sandbox, even when collection failed.
 	pages, collectErr := s.collectVerificationPageset(verifyCtx, roundLog, backend, templateID, sandboxID)
-	destroyCtx, destroyCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer destroyCancel()
-	destroyCtx = inheritIncomingMetadata(destroyCtx, ctx)
-	destroyCtx = namespaces.WithNamespace(destroyCtx, namespaces.Default)
-	destroyRsp, destroyErr := s.Destroy(destroyCtx, &cubebox.DestroyCubeSandboxRequest{
-		RequestID: verifyReq.GetRequestID(),
-		SandboxID: sandboxID,
-	})
-	switch {
-	case destroyErr != nil:
-		roundLog.Warnf("verification sandbox %s destroy failed: %v", sandboxID, destroyErr)
-	case !ret.IsSuccessCode(destroyRsp.GetRet().GetRetCode()):
-		roundLog.Warnf("verification sandbox %s destroy failed: %s", sandboxID, destroyRsp.GetRet().GetRetMsg())
-	}
+	destroyRoundSandbox()
 	if collectErr != nil {
 		return nil, collectErr
 	}
@@ -222,7 +239,6 @@ func buildProfileVerifyRequest(createReq *cubebox.RunCubeSandboxRequest, templat
 	// Deterministic sandbox id (createid honors the desired id): distinct
 	// from user sandboxes and traceable across the two rounds.
 	annos[constants.MasterAnnotationDesiredSandboxID] = fmt.Sprintf("%s-prof-%d", templateID, round)
-	annos[constants.AnnotationTemplateProfileVerify] = "true"
 	req.Annotations = annos
 	return req, nil
 }
@@ -256,7 +272,7 @@ func (s *service) collectVerificationPageset(
 		return nil, fmt.Errorf("no process maps %s for sandbox %s", memoryDevPath, sandboxID)
 	}
 
-	pages, err := collectPresentPageset(pid, memoryDevPath)
+	pages, err := collectPresentPageset(ctx, pid, memoryDevPath)
 	if err != nil {
 		return nil, fmt.Errorf("collect pagemap of pid %d: %w", pid, err)
 	}
@@ -264,12 +280,59 @@ func (s *service) collectVerificationPageset(
 	return pages, nil
 }
 
+// mapsDevT is the identity of the memory volume in the terms
+// /proc/<pid>/maps reports: the major:minor device number (of the device
+// itself for block/char devices, of the hosting filesystem for regular
+// files) plus the inode for regular files.
+type mapsDevT struct {
+	major, minor, ino uint64
+	needIno           bool
+}
+
+// resolveMapsDev stats the memory volume and derives its maps identity.
+// ok is false when the path cannot be stated; basename matching is then
+// refused.
+func resolveMapsDev(memoryDevPath string) (ident mapsDevT, ok bool) {
+	var st unix.Stat_t
+	if err := unix.Stat(memoryDevPath, &st); err != nil {
+		return mapsDevT{}, false
+	}
+	ident = mapsDevT{
+		major: uint64(unix.Major(st.Dev)),
+		minor: uint64(unix.Minor(st.Dev)),
+	}
+	switch st.Mode & unix.S_IFMT {
+	case unix.S_IFBLK, unix.S_IFCHR:
+		ident.major, ident.minor = uint64(unix.Major(st.Rdev)), uint64(unix.Minor(st.Rdev))
+	default:
+		ident.needIno = true
+		ident.ino = st.Ino
+	}
+	return ident, true
+}
+
+// mapsLineDev parses the "major:minor" hex device field of a maps line.
+func mapsLineDev(field string) (major, minor uint64, ok bool) {
+	colon := strings.IndexByte(field, ':')
+	if colon <= 0 {
+		return 0, 0, false
+	}
+	if major, err := strconv.ParseUint(field[:colon], 16, 64); err == nil {
+		if minor, err := strconv.ParseUint(field[colon+1:], 16, 64); err == nil {
+			return major, minor, true
+		}
+	}
+	return 0, 0, false
+}
+
 // findVMMProcessPid picks the candidate pid whose /proc/<pid>/maps maps the
 // template memory volume — i.e. the process hosting the restored VM. Exact
-// path matches win; basename matches are only a fallback, so a same-basename
-// file under a different directory cannot shadow the real volume.
+// path matches win; basename matches are a fallback, accepted only when the
+// line's device number (and inode for regular files) agrees with the
+// volume's stat identity.
 func findVMMProcessPid(candidates []int, memoryDevPath string) int {
 	base := filepath.Base(memoryDevPath)
+	ident, identKnown := resolveMapsDev(memoryDevPath)
 	fallback := 0
 	for _, pid := range candidates {
 		if pid <= 1 || pid == os.Getpid() {
@@ -279,7 +342,7 @@ func findVMMProcessPid(candidates []int, memoryDevPath string) int {
 		if err != nil {
 			continue
 		}
-		exact, loose := mapsContainPath(string(content), memoryDevPath, base)
+		exact, loose := mapsContainPath(string(content), memoryDevPath, base, ident, identKnown)
 		if exact {
 			return pid
 		}
@@ -290,20 +353,44 @@ func findVMMProcessPid(candidates []int, memoryDevPath string) int {
 	return fallback
 }
 
+// mapsLineMatches reports whether one parsed maps line ("start-end perms
+// offset dev inode path") refers to the memory volume. Exact path equality
+// always matches; a basename-only match is accepted only when the volume's
+// stat identity is known and the line's device number (plus inode for
+// regular files) agrees with it. Shared by pid discovery and pagemap
+// collection so both accept the same lines.
+func mapsLineMatches(fields []string, memoryDevPath, baseName string, ident mapsDevT, identKnown bool) bool {
+	path := fields[5]
+	if path == memoryDevPath {
+		return true
+	}
+	if filepath.Base(path) != baseName || !identKnown {
+		return false
+	}
+	major, minor, ok := mapsLineDev(fields[3])
+	if !ok || major != ident.major || minor != ident.minor {
+		return false
+	}
+	if ident.needIno && fields[4] != strconv.FormatUint(ident.ino, 10) {
+		return false
+	}
+	return true
+}
+
 // mapsContainPath reports whether any maps line references memoryDevPath,
-// separately for exact path equality and basename-only matches (the latter
-// tolerates dm/loop path renames between resolve time and mmap time).
-func mapsContainPath(mapsData, memoryDevPath, baseName string) (exact, loose bool) {
+// separately for exact path equality and verified basename-only matches (the
+// latter tolerates dm/loop path renames between resolve time and mmap time,
+// but requires device-number agreement with the resolved volume).
+func mapsContainPath(mapsData, memoryDevPath, baseName string, ident mapsDevT, identKnown bool) (exact, loose bool) {
 	for _, line := range strings.Split(mapsData, "\n") {
 		fields := strings.Fields(strings.TrimSpace(line))
 		if len(fields) < 6 {
 			continue
 		}
-		path := fields[5]
-		if path == memoryDevPath {
+		if fields[5] == memoryDevPath {
 			return true, true
 		}
-		if filepath.Base(path) == baseName {
+		if mapsLineMatches(fields, memoryDevPath, baseName, ident, identKnown) {
 			loose = true
 		}
 	}
@@ -318,15 +405,15 @@ type procMapLine struct {
 }
 
 // parseMapsLine parses "start-end perms offset dev inode path" fields and
-// keeps only readable mappings of memoryDevPath. Basename match tolerates
-// dm/loop path renames between resolve time and mmap time.
-func parseMapsLine(line, memoryDevPath string) (procMapLine, bool) {
+// keeps only readable mappings of memoryDevPath, matched like pid discovery
+// (mapsContainPath): basename matches tolerate dm/loop path renames and are
+// accepted only with device-number (and inode) agreement.
+func parseMapsLine(line, memoryDevPath string, ident mapsDevT, identKnown bool) (procMapLine, bool) {
 	fields := strings.Fields(strings.TrimSpace(line))
 	if len(fields) < 6 {
 		return procMapLine{}, false
 	}
-	path := fields[5]
-	if path != memoryDevPath && filepath.Base(path) != filepath.Base(memoryDevPath) {
+	if !mapsLineMatches(fields, memoryDevPath, filepath.Base(memoryDevPath), ident, identKnown) {
 		return procMapLine{}, false
 	}
 	if !strings.HasPrefix(fields[1], "r") {
@@ -354,7 +441,7 @@ func parseMapsLine(line, memoryDevPath string) (procMapLine, bool) {
 // collectPresentPageset reads /proc/<pid>/maps + pagemap and returns the set
 // of present page numbers (in memory-file page units) among the process's
 // mappings of memoryDevPath.
-func collectPresentPageset(pid int, memoryDevPath string) (map[uint64]struct{}, error) {
+func collectPresentPageset(ctx context.Context, pid int, memoryDevPath string) (map[uint64]struct{}, error) {
 	mapsData, err := os.ReadFile(fmt.Sprintf("/proc/%d/maps", pid))
 	if err != nil {
 		return nil, fmt.Errorf("read maps: %w", err)
@@ -364,16 +451,20 @@ func collectPresentPageset(pid int, memoryDevPath string) (map[uint64]struct{}, 
 		return nil, fmt.Errorf("open pagemap: %w", err)
 	}
 	defer pagemap.Close()
-	return parsePresentPageset(string(mapsData), pagemap, memoryDevPath, uint64(os.Getpagesize()))
+	return parsePresentPageset(ctx, string(mapsData), pagemap, memoryDevPath, uint64(os.Getpagesize()))
 }
 
 // parsePresentPageset walks the maps entries matching memoryDevPath and reads
 // the pagemap present bits for their vaddr ranges. Split from
 // collectPresentPageset for fixture-driven unit tests.
-func parsePresentPageset(mapsData string, pagemap io.ReadSeeker, memoryDevPath string, pageSize uint64) (map[uint64]struct{}, error) {
+func parsePresentPageset(ctx context.Context, mapsData string, pagemap io.ReadSeeker, memoryDevPath string, pageSize uint64) (map[uint64]struct{}, error) {
+	ident, identKnown := resolveMapsDev(memoryDevPath)
 	pages := map[uint64]struct{}{}
 	for _, line := range strings.Split(mapsData, "\n") {
-		m, ok := parseMapsLine(line, memoryDevPath)
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("pagemap collection cancelled: %w", err)
+		}
+		m, ok := parseMapsLine(line, memoryDevPath, ident, identKnown)
 		if !ok {
 			continue
 		}
@@ -467,6 +558,24 @@ func mergeHotExtents(pages map[uint64]struct{}, coalesce uint64, memFileSize uin
 		total += e[1]
 	}
 	return extents, total
+}
+
+// checkHotProfileCaps rejects profiles the consumer should not carry: empty
+// ones, totals over 1/hotPagesMaxTotalDen of the memory volume, or extent
+// counts over hotPagesMaxExtents.
+func checkHotProfileCaps(extents [][2]uint64, totalBytes, memFileSize uint64) error {
+	if totalBytes == 0 {
+		return errors.New("merged profile is empty")
+	}
+	if totalBytes*hotPagesMaxTotalDen > memFileSize {
+		return fmt.Errorf("profile total %d bytes exceeds 1/%d of memory size %d",
+			totalBytes, hotPagesMaxTotalDen, memFileSize)
+	}
+	if len(extents) > hotPagesMaxExtents {
+		return fmt.Errorf("profile has %d extents, over the %d cap",
+			len(extents), hotPagesMaxExtents)
+	}
+	return nil
 }
 
 // hotPagesFile is the profile schema consumed by hypervisor/vmm hotset.rs.

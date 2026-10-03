@@ -6,8 +6,10 @@ package cubebox
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,7 +26,7 @@ const testMemoryDev = "/dev/cubecow/tpl-a-memory"
 
 func TestParseMapsLineExactMatch(t *testing.T) {
 	line := "00001000-00003000 r--p 00000000 08:01 123 " + testMemoryDev
-	m, ok := parseMapsLine(line, testMemoryDev)
+	m, ok := parseMapsLine(line, testMemoryDev, mapsDevT{}, false)
 	if !ok {
 		t.Fatalf("expected match")
 	}
@@ -34,23 +36,45 @@ func TestParseMapsLineExactMatch(t *testing.T) {
 }
 
 func TestParseMapsLineBasenameFallback(t *testing.T) {
-	// dev path renamed between resolve and mmap: basename still matches
+	// dev path renamed between resolve and mmap: basename matches only with
+	// device agreement
+	verified := mapsDevT{major: 0x8, minor: 0x1, ino: 123}
 	line := "00001000-00003000 rw-p 00000000 08:01 123 /dev/dm-7"
-	if _, ok := parseMapsLine(line, testMemoryDev); ok {
+	if _, ok := parseMapsLine(line, testMemoryDev, verified, true); ok {
 		t.Fatalf("dm-7 basename must not match tpl-a-memory")
 	}
 	line = "00001000-00003000 rw-p 00000000 08:01 123 /dev/cubecow/tpl-a-memory2"
-	if _, ok := parseMapsLine(line, testMemoryDev); ok {
+	if _, ok := parseMapsLine(line, testMemoryDev, verified, true); ok {
 		t.Fatalf("different volume must not match")
 	}
 	line = "00001000-00003000 rw-p 00000000 259:12 999 /dev/nvme0n12 " // basename differs
-	if _, ok := parseMapsLine(line, "/dev/nvme0n1"); ok {
+	if _, ok := parseMapsLine(line, "/dev/nvme0n1", verified, true); ok {
 		t.Fatalf("basename prefix must not match")
 	}
 	line = "00001000-00003000 rw-p 00000000 08:01 123 /data/cube/tpl-a-memory"
-	m, ok := parseMapsLine(line, "/dev/mapper/tpl-a-memory")
+	m, ok := parseMapsLine(line, "/dev/mapper/tpl-a-memory", verified, true)
 	if !ok || m.startAddr != 0x1000 {
-		t.Fatalf("expected basename fallback match: %+v ok=%v", m, ok)
+		t.Fatalf("expected verified basename fallback match: %+v ok=%v", m, ok)
+	}
+	// same basename but a different device number: a different volume
+	other := verified
+	other.minor++
+	if _, ok := parseMapsLine(line, "/dev/mapper/tpl-a-memory", other, true); ok {
+		t.Fatalf("basename fallback must require device-number agreement")
+	}
+	// identity unknown (volume cannot be stated): basename must not match
+	if _, ok := parseMapsLine(line, "/dev/mapper/tpl-a-memory", verified, false); ok {
+		t.Fatalf("basename fallback must be refused without stat identity")
+	}
+	// regular-file volume: the inode must agree too
+	regIdent := mapsDevT{major: 0x8, minor: 0x1, ino: 123, needIno: true}
+	if _, ok := parseMapsLine(line, "/dev/mapper/tpl-a-memory", regIdent, true); !ok {
+		t.Fatalf("matching inode must be accepted for regular files")
+	}
+	wrongIno := regIdent
+	wrongIno.ino++
+	if _, ok := parseMapsLine(line, "/dev/mapper/tpl-a-memory", wrongIno, true); ok {
+		t.Fatalf("basename fallback must require inode agreement for regular files")
 	}
 }
 
@@ -62,7 +86,7 @@ func TestParseMapsLineRejects(t *testing.T) {
 		"short line":     "00001000 r--p",
 	}
 	for name, line := range cases {
-		if _, ok := parseMapsLine(line, testMemoryDev); ok {
+		if _, ok := parseMapsLine(line, testMemoryDev, mapsDevT{}, false); ok {
 			t.Fatalf("%s: expected no match", name)
 		}
 	}
@@ -106,7 +130,7 @@ func TestParsePresentPageset(t *testing.T) {
 	raw := pagemapFixture(entries, 8)
 	pm := bytes.NewReader(raw)
 
-	pages, err := parsePresentPageset(mapsData, pm, testMemoryDev, pageSize)
+	pages, err := parsePresentPageset(context.Background(), mapsData, pm, testMemoryDev, pageSize)
 	if err != nil {
 		t.Fatalf("parsePresentPageset: %v", err)
 	}
@@ -191,6 +215,43 @@ func TestMergeHotExtentsClampsToFileSize(t *testing.T) {
 	}
 }
 
+func TestCheckHotProfileCaps(t *testing.T) {
+	const pageSize = uint64(4096)
+	memSize := uint64(1) << 30 // 1GiB memory volume
+
+	// well-formed small profile passes
+	if err := checkHotProfileCaps([][2]uint64{{0, 64 * pageSize}}, 64*pageSize, memSize); err != nil {
+		t.Fatalf("small profile rejected: %v", err)
+	}
+
+	// empty profile
+	if err := checkHotProfileCaps(nil, 0, memSize); err == nil {
+		t.Fatal("empty profile accepted")
+	}
+
+	// total over the 1/hotPagesMaxTotalDen share of the volume
+	if err := checkHotProfileCaps([][2]uint64{{0, memSize}}, memSize, memSize); err == nil {
+		t.Fatal("over-total profile accepted")
+	}
+
+	// extent count over the cap: hotPagesMaxExtents+1 one-page extents
+	over := make([][2]uint64, hotPagesMaxExtents+1)
+	var total uint64
+	for i := range over {
+		over[i] = [2]uint64{uint64(i) * 8 * pageSize, pageSize}
+		total += pageSize
+	}
+	if err := checkHotProfileCaps(over, total, memSize); err == nil {
+		t.Fatal("over-count profile accepted")
+	}
+
+	// exactly at the cap is fine
+	at := over[:hotPagesMaxExtents]
+	if err := checkHotProfileCaps(at, total-pageSize, memSize); err != nil {
+		t.Fatalf("at-cap profile rejected: %v", err)
+	}
+}
+
 // ---- profile file ----
 
 func TestWriteHotPagesFileAtomicAndReadable(t *testing.T) {
@@ -250,9 +311,6 @@ func TestBuildProfileVerifyRequest(t *testing.T) {
 	}
 	if annos[constants.MasterAnnotationDesiredSandboxID] != "tpl-a-prof-1" {
 		t.Fatalf("unexpected desired sandbox id %q", annos[constants.MasterAnnotationDesiredSandboxID])
-	}
-	if annos[constants.AnnotationTemplateProfileVerify] != "true" {
-		t.Fatalf("verify marker missing")
 	}
 	if annos[constants.MasterAnnotationStorageBackend] != "xfs" {
 		t.Fatalf("unrelated annotations must be kept")
@@ -319,5 +377,71 @@ func TestFindVMMProcessPidEmptyCandidates(t *testing.T) {
 	self := os.Getpid()
 	if got := findVMMProcessPid([]int{self, -1, 0, 1}, testMemoryDev); got != 0 {
 		t.Fatalf("expected self/special pids to be skipped, got %d", got)
+	}
+}
+
+// ---- device-verified basename fallback ----
+
+// mapsLineFor renders a maps line from the real stat identity of path.
+func mapsLineFor(t *testing.T, path string) (string, mapsDevT) {
+	t.Helper()
+	ident, ok := resolveMapsDev(path)
+	if !ok {
+		t.Fatalf("resolveMapsDev(%s) failed", path)
+	}
+	return fmt.Sprintf("00001000-00003000 rw-p 00000000 %02x:%02x %d %s",
+		ident.major, ident.minor, ident.ino, path), ident
+}
+
+func TestMapsContainPathFallbackRequiresDeviceAgreement(t *testing.T) {
+	real := filepath.Join(t.TempDir(), "tpl-a-memory")
+	if err := os.WriteFile(real, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	line, ident := mapsLineFor(t, real)
+
+	// exact path always matches, regardless of the device field
+	if exact, _ := mapsContainPath(line, real, "tpl-a-memory", ident, true); !exact {
+		t.Fatalf("expected exact match")
+	}
+	// verified basename fallback: same basename, same device number
+	renamed := "/run/other/dir/tpl-a-memory"
+	if exact, loose := mapsContainPath(line, renamed, "tpl-a-memory", ident, true); exact || !loose {
+		t.Fatalf("expected verified loose match, got exact=%v loose=%v", exact, loose)
+	}
+	// same basename but the identity is unknown: must not match
+	if _, loose := mapsContainPath(line, renamed, "tpl-a-memory", ident, false); loose {
+		t.Fatalf("loose match must be refused when the volume cannot be stated")
+	}
+	// same basename, different device number: a different volume — must not match
+	other := ident
+	other.minor++
+	if _, loose := mapsContainPath(line, renamed, "tpl-a-memory", other, true); loose {
+		t.Fatalf("loose match must require device-number agreement")
+	}
+	if ident.needIno {
+		// regular files must also agree on the inode
+		wrongIno := ident
+		wrongIno.ino++
+		if _, loose := mapsContainPath(line, renamed, "tpl-a-memory", wrongIno, true); loose {
+			t.Fatalf("loose match must require inode agreement for regular files")
+		}
+	}
+}
+
+func TestResolveMapsDevRegularFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mem.bin")
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	ident, ok := resolveMapsDev(path)
+	if !ok {
+		t.Fatalf("expected identity for a statable regular file")
+	}
+	if !ident.needIno || ident.ino == 0 {
+		t.Fatalf("regular file identity must carry the inode: %+v", ident)
+	}
+	if _, ok := resolveMapsDev(filepath.Join(t.TempDir(), "missing")); ok {
+		t.Fatalf("identity must be refused for a missing path")
 	}
 }
