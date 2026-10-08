@@ -8,6 +8,23 @@ common:
    - "/usr/local/cubetools/cube_exec_cmd_before_exist.sh"
   cgroup_set_memory_reparent_file: ""
   disable_host_cgroup: true
+
+  # NUMA affinity (openspec/changes/add-numa-affinity). Binding is opt-in per
+  # sandbox via the cube.master.instance.numa_node annotation ("auto" or a node
+  # id); with the switch off the annotation is ignored entirely.
+  numa_bind_enabled: false
+  # What happens when no node fits a bound request: besteffort deploys without
+  # binding (default), strict fails the create to the caller.
+  numa_alloc_policy: "besteffort"
+  # Measured-gate headroom (MiB) kept free of non-reclaimable memory on each
+  # node before admitting another bound sandbox.
+  numa_reserve_mem_mb: 4096
+  # Committed-gate oversell ratio; mirrors the host quota ratio (5/4).
+  numa_mem_ratio: 1.25
+  # Stick VMs of the same template snapshot lineage to one node so the shared
+  # base page cache lands on (and stays local to) the binding node.
+  numa_template_affinity: false
+
   # Disable the legacy netfile.
   disable_host_netfile: true
   # Default DNS servers for guest containers.

@@ -104,6 +104,17 @@ type CommonConf struct {
 	CgroupDisableMemoryReparentFile string `yaml:"cgroup_disable_memory_reparent_file"`
 	CgroupDisableCpusetList         string `yaml:"cgroup_disable_cpuset_list"`
 
+	// NUMA affinity (openspec/changes/add-numa-affinity). Binding is opt-in
+	// per sandbox via the cube.master.instance.numa_node annotation ("auto"
+	// or a node id); the knobs below gate and tune the node-level ledger.
+	// numa_mem_ratio mirrors the host quota ratio (5/4) so the NUMA ledger
+	// oversells at the same rate as the global model.
+	NumaBindEnabled      bool    `yaml:"numa_bind_enabled"`
+	NumaAllocPolicy      string  `yaml:"numa_alloc_policy"`   // besteffort (default) | strict
+	NumaReserveMemMB     uint64  `yaml:"numa_reserve_mem_mb"` // measured-gate headroom; default 4096
+	NumaMemRatio         float64 `yaml:"numa_mem_ratio"`      // committed-gate ratio; default 1.25
+	NumaTemplateAffinity bool    `yaml:"numa_template_affinity"`
+
 	DisableHostNetfile bool `yaml:"disable_host_netfile"`
 
 	DefaultDNSServers  []string      `yaml:"default_dns_servers"`
@@ -321,6 +332,9 @@ func GetConfig() *Config {
 
 //go:noinline
 func GetCommon() *CommonConf {
+	if cfg == nil {
+		return nil
+	}
 	return cfg.Common
 }
 

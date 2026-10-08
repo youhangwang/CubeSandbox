@@ -56,6 +56,11 @@ func init() {
 }
 
 func (c *Config) ShouldSetMemoryReparentFile() bool {
+	if c == nil {
+		// Standalone pool tests build a bare cgPool without the plugin
+		// config; default matches the production zero value.
+		return true
+	}
 	return !c.dynamicDisableMemoryReparentFile
 }
 

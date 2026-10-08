@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/containerd/cgroups/v3"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/allocator"
 	dynamConf "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/config"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
@@ -72,6 +73,21 @@ func (p *cgPool) createCgroup(ctx context.Context, fullCgID uint32) error {
 		return nil
 	}
 	log.G(ctx).Debugf("cgroup %s not exist, create it", group)
+	if IsPoolV2ID(fullCgID) && cgroups.Mode() != cgroups.Unified {
+		// cgroup v1 kernel: cpuset values do not propagate into child groups
+		// (a fresh child's cpuset is empty and cannot hold tasks), so every
+		// pool-v2 sandbox group gets its node's cpuset backfilled explicitly
+		// (design D3; semantics verified on a v1 host).
+		if nodeID, nodeErr := CgroupID2NumaID(fullCgID); nodeErr == nil {
+			if nodes := numa.GetAllNumaNodes(); int(nodeID) < len(nodes) {
+				if err := handle.CreateWithCpuSet(ctx, group, nodes[nodeID].Cpulist, nodeID); err != nil {
+					return fmt.Errorf("create v1 cgroup with cpuset %s error: %w", group, err)
+				}
+				l.setupMemoryReparentFile(ctx, fullCgID, l.config.ShouldSetMemoryReparentFile())
+				return nil
+			}
+		}
+	}
 	err = handle.Create(ctx, group)
 	if err != nil {
 		return fmt.Errorf("create cgroup %s error: %w", group, err)
@@ -104,14 +120,16 @@ func (p *cgPool) init() error {
 	}
 
 	for _, inuseCgIdBytes := range allUse {
-		inuseCgIdInt, err := strconv.Atoi(string(inuseCgIdBytes))
+		// Entries are either the legacy bare decimal cgroup id or the JSON
+		// numa ledger entry; both carry the cgroup id.
+		entry, err := parseNumaLedgerValue(inuseCgIdBytes)
 		if err != nil {
 			continue
 		}
-		if inuseCgIdInt < CgPoolV1IdLimit {
-			p.poolV1.initialAssign(uint32(inuseCgIdInt))
+		if entry.CgID < CgPoolV1IdLimit {
+			p.poolV1.initialAssign(entry.CgID)
 		} else {
-			p.poolV2.initialAssign(uint32(inuseCgIdInt))
+			p.poolV2.initialAssign(entry.CgID)
 		}
 	}
 	poolV1ActualSize := p.poolV1.cgRanger.Cap()

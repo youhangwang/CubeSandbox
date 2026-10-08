@@ -7,11 +7,14 @@ package cubebox
 import (
 	"fmt"
 	"math"
+	"strconv"
+	"strings"
 	"sync/atomic"
 
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/numa"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
+	"github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
@@ -35,18 +38,33 @@ func (s *service) setRequestResource(createInfo *workflow.CreateContext, reqInfo
 	createInfo.CPU = cpu
 	createInfo.Memory = int64(math.Ceil(mem / 1024 / 1024 / 1024))
 	createInfo.PCIMode = constants.PCIModePF
+	// NumaNode here is bookkeeping only (round-robin or master-specified hint);
+	// actual NUMA binding for annotated sandboxes is decided by the cgroup
+	// plugin against the per-node ledger (see cgroup/numa_alloc.go).
 	useRoundRobinNumaNode := true
 	if reqInfo.GetAnnotations() != nil {
 
 		if numaStr, ok := reqInfo.GetAnnotations()[constants.MasterAnnotationsNumaNode]; ok {
-			var numaNode int32
-			if _, err := fmt.Sscanf(numaStr, "%d", &numaNode); err == nil {
-				if numaNode < 0 || numaNode >= int32(numa.GetMaxNumaNodeId()) {
-					return fmt.Errorf("invalid numa node: %d", numaNode)
+			if strings.TrimSpace(numaStr) == "auto" {
+				// Binding intent: ledger picks the node later; keep the
+				// round-robin value as the bookkeeping default.
+				useRoundRobinNumaNode = true
+			} else if numaNode, err := strconv.Atoi(strings.TrimSpace(numaStr)); err == nil {
+				// Valid ids are 0..GetMaxNumaNodeId() inclusive — the old
+				// `>= max` check rejected the top node (a latent bug that
+				// never fired because the annotation had no producer).
+				if numaNode < 0 || numaNode > numa.GetMaxNumaNodeId() {
+					// Malformed value degrades to auto with a warning instead
+					// of failing the create (strict only covers capacity).
+					CubeLog.Warnf("numa annotation %q out of range, fallback to auto", numaStr)
+					useRoundRobinNumaNode = true
+				} else {
+					createInfo.NumaNode = int32(numaNode)
+					useRoundRobinNumaNode = false
 				}
-
-				createInfo.NumaNode = numaNode
-				useRoundRobinNumaNode = false
+			} else {
+				CubeLog.Warnf("invalid numa annotation %q, fallback to auto", numaStr)
+				useRoundRobinNumaNode = true
 			}
 		}
 

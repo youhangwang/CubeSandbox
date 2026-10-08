@@ -66,7 +66,9 @@ func (p *NumaInfo) init() error {
 
 	p.numaCount = len(p.numaNodes)
 
-	if len(config.GetCommon().CgroupDisableCpusetList) > 0 {
+	// GetCommon may return nil before config.Init runs (unit tests); without
+	// the guard numa info init panics on the config dependency.
+	if c := config.GetCommon(); c != nil && len(c.CgroupDisableCpusetList) > 0 {
 
 		for i, node := range p.numaNodes {
 			node.Cpulist = removeDisabledCpus(node.Cpulist, strings.Split(config.GetCommon().CgroupDisableCpusetList, ","))

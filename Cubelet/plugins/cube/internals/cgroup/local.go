@@ -50,6 +50,10 @@ type CgPlugin struct {
 
 	vmSnapshotSpecs VMSnapshotSpecsByProduct
 	vmSpecLock      sync.RWMutex
+
+	// consecutive sticky-node gate failures per template lineage (remap trigger)
+	numaStickyMissMu sync.Mutex
+	numaStickyMiss   map[string]int
 }
 
 type VMSnapshotSpecsByProduct map[string][]VmSnapshotSpec
@@ -319,6 +323,8 @@ func (l *CgPlugin) Create(ctx context.Context, opts *workflow.CreateContext) (er
 	var fullCgID *uint32
 	usePoolV2 := false
 	numa := opts.GetNumaNode()
+	numaDegradeReason := ""
+	numaStickyKey := ""
 
 	defer func() {
 		if err != nil && fullCgID != nil {
@@ -347,6 +353,30 @@ func (l *CgPlugin) Create(ctx context.Context, opts *workflow.CreateContext) (er
 	}
 	l.vmSpecLock.RUnlock()
 
+	// NUMA binding is opt-in via cube.master.instance.numa_node; the ledger,
+	// both admission gates and the degrade chain live in numa_alloc.go.
+	if intent, specNode := parseNumaIntent(realReq.GetAnnotations()); intent != numaIntentNone {
+		if cfg := dynamConf.GetCommon(); cfg != nil && cfg.NumaBindEnabled {
+			if cfg.NumaTemplateAffinity && !opts.IsPauseResume() {
+				// Pause snapshots have per-sandbox bases; only template
+				// lineages share a base image worth sticking together.
+				numaStickyKey, _ = opts.GetSnapshotTemplateID()
+			}
+			res, allocErr := l.allocateNumaNode(intent, specNode, numaStickyKey,
+				resourceQuantity.HostMemQ.Value(), resourceQuantity.HostCpuQ.MilliValue())
+			if allocErr != nil {
+				return ret.Errorf(errorcode.ErrorCode_PreConditionFailed, "%s: %v", numaCapErrPrefix, allocErr)
+			}
+			if res.Bound {
+				usePoolV2 = true
+				numa = res.Node
+				opts.NumaNode = res.Node
+			} else {
+				numaDegradeReason = res.Reason
+			}
+		}
+	}
+
 	fullCgID, err = l.pool.Get(ctx, opts.GetSandboxID(), usePoolV2, numa)
 	if err != nil {
 		return ret.Errorf(errorcode.ErrorCode_CreateCgroupFailed, "%s", err)
@@ -356,10 +386,24 @@ func (l *CgPlugin) Create(ctx context.Context, opts *workflow.CreateContext) (er
 	if err != nil {
 		log.G(ctx).Warnf("capture host metrics baseline for cgroup assignment %s: %v", cgroupPath, err)
 	}
-	cgIDStr := strconv.Itoa(int(*fullCgID))
-	err = l.db.Set(bucket, opts.GetSandboxID(), []byte(cgIDStr))
+	var ledgerValue []byte
+	if usePoolV2 {
+		ledgerValue = encodeNumaLedgerEntry(numaLedgerEntry{
+			CgID:      *fullCgID,
+			HostMemQ:  resourceQuantity.HostMemQ.Value(),
+			HostCpuQ:  resourceQuantity.HostCpuQ.MilliValue(),
+			StickyKey: numaStickyKey,
+		})
+	} else {
+		ledgerValue = []byte(strconv.Itoa(int(*fullCgID)))
+	}
+	err = l.db.Set(bucket, opts.GetSandboxID(), ledgerValue)
 	if err != nil {
 		return ret.Errorf(errorcode.ErrorCode_CreateCgroupFailed, "failed save to db: %v", err)
+	}
+
+	if numaDegradeReason != "" {
+		CubeLog.Warnf("numa bind degraded for sandbox %s: %s", opts.GetSandboxID(), numaDegradeReason)
 	}
 
 	opts.CgroupInfo = &Info{
@@ -367,6 +411,8 @@ func (l *CgPlugin) Create(ctx context.Context, opts *workflow.CreateContext) (er
 		ResourceQuantity:                       *resourceQuantity,
 		VmSnapshotSpec:                         vmSnapshotSpec,
 		UsePoolV2:                              usePoolV2,
+		NumaDegraded:                           numaDegradeReason != "",
+		NumaDegradeReason:                      numaDegradeReason,
 		HostMetricsBaseline:                    baseline,
 		HostMetricsBaselineMissingAtAssignment: baseline == nil,
 	}
@@ -427,12 +473,12 @@ func (l *CgPlugin) Destroy(ctx context.Context, opts *workflow.DestroyContext) e
 		return nil
 	}
 
-	fullcgID, err := strconv.Atoi(string(cgIDStr))
-	if err != nil {
+	entry, parseErr := parseNumaLedgerValue(cgIDStr)
+	if parseErr != nil {
 		return ret.Errorf(errorcode.ErrorCode_DestroyCgroupFailed, "invalid cgroup id %s", string(cgIDStr))
 	}
 
-	l.pool.Put(ctx, uint32(fullcgID))
+	l.pool.Put(ctx, entry.CgID)
 	err = l.db.Delete(bucket, opts.SandboxID)
 	if err != nil {
 		if errors.Is(err, utils.ErrorKeyNotFound) || errors.Is(err, utils.ErrorBucketNotFound) {
@@ -488,6 +534,8 @@ func (l *CgPlugin) CollectMetric(ctx context.Context) *CgroupMetrics {
 	metrics.QuotaCpuUsage = quotaMCpuUsage
 	metrics.QuotaMemMbUsage = quotaMemMbUsage
 	log.G(ctx).Infof("collect cgroup cpu:%v,mem:%v", quotaMCpuUsage, quotaMemUsage)
+
+	l.reconcileNumaLedger(ctx)
 	return metrics
 }
 
@@ -554,6 +602,8 @@ type Info struct {
 	ResourceQuantity                       cubeboxstore.ResourceWithOverHead
 	VmSnapshotSpec                         CubeVMMResource
 	UsePoolV2                              bool
+	NumaDegraded                           bool
+	NumaDegradeReason                      string
 	HostMetricsBaseline                    *cubeboxstore.HostMetricsBaseline
 	HostMetricsBaselineMissingAtAssignment bool
 }
