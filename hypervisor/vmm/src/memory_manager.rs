@@ -724,6 +724,11 @@ impl MemoryManager {
                             offset += range.length;
                         }
                     }
+                    // Hotset recording (independent path): when activated,
+                    // the region is backed by the recording memfd — laid
+                    // out like the memory volume — instead of the volume
+                    // file itself, and its first touches are traced.
+                    let file = crate::hotset_record::take_memfd_region_backing(file);
                     let region = MemoryManager::create_ram_region(
                         &zone_config.file,
                         guest_ram_mapping.file_offset,
@@ -742,6 +747,7 @@ impl MemoryManager {
                         offset,
                         thp,
                     )?;
+                    crate::hotset_record::register_region(&region, offset);
                     memory_regions.push(Arc::clone(&region));
                     if let Some(memory_zone) = memory_zones.get_mut(&guest_ram_mapping.zone_id) {
                         if guest_ram_mapping.virtio_mem {
@@ -1358,6 +1364,21 @@ impl MemoryManager {
                         None
                     }
                 };
+                // Hotset first-touch ORDER recording (independent path, see
+                // hotset_record.rs): a `hotset-record` marker beside the
+                // snapshot state — dropped by cubelet around the profiling
+                // verification rounds only — switches guest RAM backing to
+                // a memfd registered with userfaultfd and traces every
+                // first touch in order. The plain volume-backed restore
+                // above is untouched; any failure degrades to it.
+                if let Ok(snapshot_dir) = url_to_path(source_url) {
+                    if let Err(e) = crate::hotset_record::activate_if_requested(
+                        &snapshot_dir,
+                        memory_file_target.path(),
+                    ) {
+                        warn!("restore memory hotset recording not activated: {e}");
+                    }
+                }
                 Some(file)
             } else {
                 None

@@ -1,0 +1,442 @@
+// Copyright © 2026 Tencent Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+// First-touch ORDER recording for template hotset profiling.
+//
+// The hotset consumer (hotset.rs) restores the guest's page-cache warmth,
+// but the plain profile carries no ORDER: pages are merged into extents and
+// walked in extent order, while the guest faults them in its own order. On
+// seek-bound storage that mismatch is the difference between a faster boot
+// and a slower one.
+//
+// This module records the exact first-touch order. It is deliberately an
+// INDEPENDENT path from the plain restore: when a `hotset-record` marker
+// file exists next to the snapshot state (cubelet drops it only around the
+// profiling verification rounds), every guest RAM region is backed by a
+// memfd registered with userfaultfd (missing mode) instead of the volume
+// file. The handler thread resolves each fault by preading the page from
+// the memory volume and UFFDIO_COPYing it in, appending the volume offset
+// to a trace file — the exact sequence of first touches, with none of the
+// readahead slop a pagemap snapshot carries.
+//
+// Everything here is best-effort and process-local: the shim hosts one VM,
+// the recorder activates at most once per process, any failure degrades to
+// the plain volume-backed restore, and the handler thread simply dies with
+// the process when the recording VM goes away.
+
+use std::fs::{self, File};
+use std::io::Write;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use log::{info, warn};
+use vm_memory::GuestMemoryRegion;
+
+use crate::GuestRegionMmap;
+
+/// Marker file the profiler drops into the snapshot state dir to ask this
+/// process to record first-touch order.
+const MARKER_FILE: &str = "hotset-record";
+/// Trace files, pid-suffixed so the two profiling rounds never collide.
+const TRACE_PREFIX: &str = "hotset-record.trace.";
+const TRACE_MAGIC: &[u8; 4] = b"HSTR";
+const TRACE_VERSION: u32 = 1;
+
+const PAGE: u64 = 4096;
+/// Events batched per read(2) on the uffd fd.
+const UFFD_MSG_BATCH: usize = 64;
+/// sizeof(struct uffd_msg): event byte + flags + padding + fault payload.
+const UFFD_MSG_SIZE: usize = 24;
+/// Trace records buffered before flushing to disk.
+const TRACE_FLUSH_RECORDS: usize = 8192;
+
+// userfaultfd syscall numbers (asm-generic unistd: x86_64 323, aarch64 282).
+#[cfg(target_arch = "aarch64")]
+const SYS_USERFAULTFD: libc::c_long = 282;
+#[cfg(not(target_arch = "aarch64"))]
+const SYS_USERFAULTFD: libc::c_long = 323;
+
+// userfaultfd ioctl numbers: stable kernel ABI, spelled out here so no
+// extra crate is needed. Sizes: uffdio_api=24, uffdio_register=32,
+// uffdio_copy=40; _IOWR(0xAA, nr, size).
+const UFFD_API: u64 = 0xAA;
+const UFFDIO_REGISTER_MODE_MISSING: u64 = 1 << 0;
+const UFFD_EVENT_PAGEFAULT: u8 = 1;
+pub(crate) const UFFDIO_API_IOCTL: libc::c_ulong = 0xc018_aa3f;
+pub(crate) const UFFDIO_REGISTER_IOCTL: libc::c_ulong = 0xc020_aa20;
+pub(crate) const UFFDIO_COPY_IOCTL: libc::c_ulong = 0xc028_aa32;
+
+#[repr(C)]
+struct UffdioApi {
+    api: u64,
+    features: u64,
+    ioctls: u64,
+}
+
+#[repr(C)]
+struct UffdioRange {
+    start: u64,
+    len: u64,
+}
+
+#[repr(C)]
+struct UffdioRegister {
+    range: UffdioRange,
+    mode: u64,
+    ioctls: u64,
+}
+
+#[repr(C)]
+struct UffdioCopy {
+    dst: u64,
+    src: u64,
+    len: u64,
+    mode: u64,
+    copy: u64,
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<UffdioApi>() == 24);
+    assert!(std::mem::size_of::<UffdioRegister>() == 32);
+    assert!(std::mem::size_of::<UffdioCopy>() == 40);
+};
+
+/// One memfd-backed guest RAM region under recording.
+struct RecordedRegion {
+    /// Host virtual address of the shim's mapping of this region.
+    host_addr: u64,
+    /// Byte length of the mapping.
+    len: u64,
+    /// Offset of this region's backing pages inside the memory volume.
+    volume_offset: u64,
+}
+
+/// State shared between the registering thread and the fault handler. The
+/// fault path only ever takes `regions` (held briefly by registrars), so a
+/// registering thread can never stall an in-flight guest fault.
+struct Recorder {
+    uffd_fd: i32,
+    volume: File,
+    /// Backs every guest RAM region: sized and laid out exactly like the
+    /// memory volume, so each region's `snap_offset` maps 1:1.
+    memfd: File,
+    /// Taken by the handler thread at spawn; the only trace writer.
+    trace: Mutex<Option<File>>,
+    regions: Mutex<Vec<RecordedRegion>>,
+}
+
+static RECORDER: OnceLock<Arc<Recorder>> = OnceLock::new();
+
+/// True when this process is recording first touches. Cheap, lock-free.
+pub fn active() -> bool {
+    RECORDER.get().is_some()
+}
+
+/// Activate recording when the snapshot state dir carries the marker file.
+/// `volume_path` is the memory volume the handler preads from; the trace is
+/// written beside the profile in `snapshot_dir`. Any failure leaves the
+/// global state inactive and the caller on the plain restore path.
+pub fn activate_if_requested(snapshot_dir: &Path, volume_path: &Path) -> Result<(), String> {
+    if RECORDER.get().is_some() {
+        return Ok(());
+    }
+    if !snapshot_dir.join(MARKER_FILE).exists() {
+        return Ok(());
+    }
+    let trace_path: PathBuf = snapshot_dir.join(format!("{TRACE_PREFIX}{}", std::process::id()));
+    let volume = File::open(volume_path).map_err(|e| format!("open volume: {e}"))?;
+    let mut trace = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&trace_path)
+        .map_err(|e| format!("open trace {}: {e}", trace_path.display()))?;
+    trace
+        .write_all(TRACE_MAGIC)
+        .and_then(|_| trace.write_all(&TRACE_VERSION.to_le_bytes()))
+        .and_then(|_| trace.write_all(&(PAGE as u32).to_le_bytes()))
+        .map_err(|e| format!("write trace header: {e}"))?;
+
+    let fd = unsafe { libc::syscall(SYS_USERFAULTFD, libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(format!("userfaultfd syscall failed: {}", io_err()));
+    }
+    let uffd_fd = fd as i32;
+    let mut api = UffdioApi {
+        api: UFFD_API,
+        features: 0,
+        ioctls: 0,
+    };
+    if unsafe { libc::ioctl(uffd_fd, UFFDIO_API_IOCTL, &mut api) } != 0 {
+        let err = io_err();
+        unsafe { libc::close(uffd_fd) };
+        return Err(format!("UFFDIO_API failed: {err}"));
+    }
+
+    // One memfd mirroring the memory volume: every guest RAM region maps it
+    // at its own `snap_offset`, exactly like the plain path maps the volume,
+    // so region content and trace offsets stay 1:1 with the volume.
+    let volume_size = volume.metadata().map_err(|e| format!("stat volume: {e}"))?.len();
+    let memfd_fd = unsafe {
+        libc::syscall(
+            libc::SYS_memfd_create,
+            b"hotset-record\0".as_ptr(),
+            libc::MFD_CLOEXEC,
+        )
+    };
+    if memfd_fd < 0 {
+        let err = io_err();
+        unsafe { libc::close(uffd_fd) };
+        return Err(format!("memfd_create failed: {err}"));
+    }
+    let memfd = unsafe { File::from_raw_fd(memfd_fd as i32) };
+    if let Err(e) = memfd.set_len(volume_size) {
+        let err = format!("memfd truncate: {e}");
+        unsafe { libc::close(uffd_fd) };
+        return Err(err);
+    }
+
+    let recorder = Arc::new(Recorder {
+        uffd_fd,
+        volume,
+        memfd,
+        trace: Mutex::new(Some(trace)),
+        regions: Mutex::new(Vec::new()),
+    });
+    if RECORDER.set(recorder).is_err() {
+        unsafe { libc::close(uffd_fd) };
+        return Ok(());
+    }
+    info!(
+        "restore memory hotset recording activated: trace={}",
+        trace_path.display()
+    );
+    Ok(())
+}
+
+/// Region backing swap: when recording is active the region is backed by
+/// the recording memfd (laid out like the memory volume) instead of the
+/// volume file itself. Returns `saved` unchanged when recording is off, so
+/// the caller keeps its plain path.
+pub fn take_memfd_region_backing(saved: Option<File>) -> Option<File> {
+    let Some(recorder) = RECORDER.get() else {
+        return saved;
+    };
+    match recorder.memfd.try_clone() {
+        // Region mappings own their dup; the recorder keeps the original.
+        Ok(dup) => Some(dup),
+        Err(e) => {
+            warn!("hotset record: memfd dup failed: {e}");
+            saved
+        }
+    }
+}
+
+/// Register a just-built guest RAM region with the uffd fd and start the
+/// handler thread on the first registration. `volume_offset` is where this
+/// region's backing pages live inside the memory volume.
+pub fn register_region(region: &GuestRegionMmap, volume_offset: u64) {
+    let Some(recorder) = RECORDER.get() else {
+        return;
+    };
+    let host_addr = region.as_ptr() as u64;
+    let len = region.len() as u64;
+    if host_addr == 0 || len == 0 {
+        return;
+    }
+    // 4K fault granularity: shmem THP would turn first touches into 2M
+    // events and blur the trace. Fresh mapping, no faults can race this.
+    unsafe {
+        libc::madvise(
+            host_addr as *mut libc::c_void,
+            len as usize,
+            libc::MADV_NOHUGEPAGE,
+        );
+    }
+    let mut reg = UffdioRegister {
+        range: UffdioRange {
+            start: host_addr,
+            len,
+        },
+        mode: UFFDIO_REGISTER_MODE_MISSING,
+        ioctls: 0,
+    };
+    if unsafe { libc::ioctl(recorder.uffd_fd, UFFDIO_REGISTER_IOCTL, &mut reg) } != 0 {
+        warn!(
+            "hotset record: UFFDIO_REGISTER failed at {host_addr:#x}: {}",
+            io_err()
+        );
+        return;
+    }
+    recorder
+        .regions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(RecordedRegion {
+            host_addr,
+            len,
+            volume_offset,
+        });
+    // One handler thread serves every registered range for the lifetime of
+    // the process; the recording VM is single-shot, so no cancel plumbing.
+    static HANDLER: OnceLock<()> = OnceLock::new();
+    HANDLER.get_or_init(|| {
+        let trace = recorder
+            .trace
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        let Some(trace) = trace else {
+            warn!("hotset record: handler not started, trace already taken");
+            return;
+        };
+        let handler = Handler {
+            recorder: Arc::clone(recorder),
+            trace,
+            buf: Vec::with_capacity(TRACE_FLUSH_RECORDS * 8),
+            msgs: vec![0u8; UFFD_MSG_SIZE * UFFD_MSG_BATCH],
+        };
+        if let Err(e) = std::thread::Builder::new()
+            .name("hotset-record".to_string())
+            .spawn(move || handler.run())
+        {
+            warn!("hotset record: handler spawn failed: {e}");
+        }
+    });
+}
+
+/// The fault service loop. Owns the trace file: it is the only writer after
+/// activation, so no locking is needed on the fault path beyond the shared
+/// region table (held briefly by registrars).
+struct Handler {
+    recorder: Arc<Recorder>,
+    trace: File,
+    buf: Vec<u8>,
+    msgs: Vec<u8>,
+}
+
+impl Handler {
+    fn run(mut self) {
+        info!("hotset record: handler started");
+        loop {
+            let n = unsafe {
+                libc::read(
+                    self.recorder.uffd_fd,
+                    self.msgs.as_mut_ptr() as *mut libc::c_void,
+                    self.msgs.len(),
+                )
+            };
+            if n < 0 && errno_is_retry() {
+                continue;
+            }
+            if n <= 0 {
+                info!("hotset record: handler exiting ({n})");
+                break;
+            }
+            // Collect first: handle_fault needs &mut self for the trace
+            // buffer, and the msgs slice borrows self immutably.
+            let mut faults = Vec::with_capacity(n as usize / UFFD_MSG_SIZE);
+            for chunk in self.msgs[..n as usize].chunks_exact(UFFD_MSG_SIZE) {
+                if chunk[0] != UFFD_EVENT_PAGEFAULT {
+                    continue;
+                }
+                faults.push(u64::from_le_bytes(chunk[8..16].try_into().expect("24-byte msg")));
+            }
+            for addr in faults {
+                self.handle_fault(addr);
+            }
+            if self.buf.len() >= TRACE_FLUSH_RECORDS * 8 {
+                self.flush();
+            }
+        }
+        self.flush();
+    }
+
+    /// Resolve one fault: pread the page from the memory volume, UFFDIO_COPY
+    /// it into the mapping, and append the volume offset to the trace. The
+    /// faulting vcpu is parked until the copy lands, so this must never skip
+    /// a fault.
+    fn handle_fault(&mut self, addr: u64) {
+        let page_addr = addr & !(PAGE - 1);
+        let regions = self
+            .recorder
+            .regions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let Some(region) = regions
+            .iter()
+            .find(|r| page_addr >= r.host_addr && page_addr < r.host_addr + r.len)
+        else {
+            return;
+        };
+        let vol_off = region.volume_offset + (page_addr - region.host_addr);
+        drop(regions);
+
+        let mut page = [0u8; PAGE as usize];
+        if !pread_full(self.recorder.volume.as_raw_fd(), &mut page, vol_off) {
+            warn!("hotset record: pread volume at {vol_off} failed");
+            return;
+        }
+        let mut copy = UffdioCopy {
+            dst: page_addr,
+            src: page.as_ptr() as u64,
+            len: PAGE,
+            mode: 0,
+            copy: 0,
+        };
+        if unsafe { libc::ioctl(self.recorder.uffd_fd, UFFDIO_COPY_IOCTL, &mut copy) } != 0 {
+            warn!(
+                "hotset record: UFFDIO_COPY failed at {page_addr:#x}: {}",
+                io_err()
+            );
+            return;
+        }
+        self.buf.extend_from_slice(&vol_off.to_le_bytes());
+    }
+
+    fn flush(&mut self) {
+        if self.buf.is_empty() {
+            return;
+        }
+        if let Err(e) = self.trace.write_all(&self.buf) {
+            warn!("hotset record: trace write failed: {e}");
+            return;
+        }
+        self.buf.clear();
+    }
+}
+
+fn pread_full(fd: i32, buf: &mut [u8], offset: u64) -> bool {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let n = unsafe {
+            libc::pread(
+                fd,
+                buf[filled..].as_mut_ptr() as *mut libc::c_void,
+                buf.len() - filled,
+                (offset as usize + filled) as libc::off_t,
+            )
+        };
+        if n < 0 {
+            if errno_is_retry() {
+                continue;
+            }
+            return false;
+        }
+        if n == 0 {
+            return false;
+        }
+        filled += n as usize;
+    }
+    true
+}
+
+fn errno_is_retry() -> bool {
+    std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+}
+
+fn io_err() -> std::io::Error {
+    std::io::Error::last_os_error()
+}

@@ -260,6 +260,25 @@ fn create_vmm_ioctl_seccomp_rule_common(
     let mut common_rules = or![
         and![Cond::new(1, ArgLen::Dword, Eq, BLKSSZGET)?],
         and![Cond::new(1, ArgLen::Dword, Eq, BLKPBSZGET)?],
+        // userfaultfd recording ioctls (hypervisor/vmm/src/hotset_record.rs)
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            crate::hotset_record::UFFDIO_API_IOCTL
+        )?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            crate::hotset_record::UFFDIO_REGISTER_IOCTL
+        )?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            crate::hotset_record::UFFDIO_COPY_IOCTL
+        )?],
         and![Cond::new(1, ArgLen::Dword, Eq, BLKIOMIN)?],
         and![Cond::new(1, ArgLen::Dword, Eq, BLKIOOPT)?],
         and![Cond::new(1, ArgLen::Dword, Eq, FIOCLEX)?],
@@ -557,6 +576,7 @@ fn vmm_thread_rules(
         (libc::SYS_madvise, vec![]),
         (libc::SYS_mbind, vec![]),
         (libc::SYS_memfd_create, vec![]),
+        (libc::SYS_userfaultfd, vec![]),
         (libc::SYS_mmap, vec![]),
         (libc::SYS_mprotect, vec![]),
         (libc::SYS_mremap, vec![]),

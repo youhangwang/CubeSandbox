@@ -78,6 +78,7 @@ pub mod device_tree;
 #[cfg(feature = "guest_debug")]
 mod gdb;
 pub mod hotset;
+pub mod hotset_record;
 pub mod interrupt;
 pub mod memory_manager;
 pub mod migration;
