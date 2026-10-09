@@ -347,9 +347,9 @@ impl Handler {
             for addr in faults {
                 self.handle_fault(addr);
             }
-            if self.buf.len() >= TRACE_FLUSH_RECORDS * 8 {
-                self.flush();
-            }
+            // Flush per batch: the trace consumer (cubelet) reads after the
+            // VM is destroyed, and this keeps the tail loss at one batch.
+            self.flush();
         }
         self.flush();
     }
@@ -439,4 +439,101 @@ fn errno_is_retry() -> bool {
 
 fn io_err() -> std::io::Error {
     std::io::Error::last_os_error()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vm_memory::{FileOffset, GuestAddress, MmapRegion};
+
+    /// Drive the real recording path without KVM: build a volume file whose
+    /// pages carry their own index, activate via the marker, back one region
+    /// with the recording memfd, touch it out of order, and assert the trace
+    /// replays the touch order (offsets resolved through the handler's
+    /// pread+UFFDIO_COPY service).
+    ///
+    /// Ignored by default: creating a userfaultfd is denied to unprivileged
+    /// users on hosts with vm.unprivileged_userfaultfd=0 (CI/dev boxes);
+    /// run with --ignored as root (as production shims run) or on a host
+    /// that permits it.
+    #[test]
+    #[ignore = "userfaultfd requires root or vm.unprivileged_userfaultfd=1"]
+    fn test_recorder_traces_first_touch_order() {
+        const REGION_LEN: u64 = 16 * PAGE; // 16 pages
+        let dir = std::env::temp_dir().join(format!(
+            "hotset-record-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let volume_path = dir.join("volume");
+        // Volume page i starts with byte i.
+        let mut volume = vec![0u8; REGION_LEN as usize];
+        for i in 0..16 {
+            volume[i * PAGE as usize] = i as u8;
+        }
+        fs::write(&volume_path, &volume).unwrap();
+        fs::write(dir.join(MARKER_FILE), b"").unwrap();
+
+        activate_if_requested(&dir, &volume_path).expect("activate recording");
+        assert!(active());
+
+        let saved = File::open(&volume_path).unwrap();
+        let memfd = take_memfd_region_backing(Some(saved)).expect("recording memfd");
+        let region = Arc::new(
+            GuestRegionMmap::new(
+                MmapRegion::build(
+                    Some(FileOffset::new(memfd, 0)),
+                    REGION_LEN as usize,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED | libc::MAP_NORESERVE,
+                )
+                .unwrap(),
+                GuestAddress(0),
+            )
+            .unwrap(),
+        );
+        register_region(&region, 0);
+
+        // Touch pages out of order from a plain thread — every first touch
+        // must be serviced by the handler and recorded in call order.
+        let base = region.as_ptr() as u64;
+        for &page in &[5u64, 2, 9, 0, 15] {
+            unsafe {
+                let p = (base + page * PAGE) as *mut u8;
+                let v = std::ptr::read_volatile(p);
+                std::ptr::write_volatile(p, v.wrapping_add(1));
+            }
+        }
+
+        // Wait for the trace to carry the five offsets in touch order.
+        let trace_path = dir.join(format!("{TRACE_PREFIX}{}", std::process::id()));
+        let want: Vec<u64> = [5u64, 2, 9, 0, 15].iter().map(|p| p * PAGE).collect();
+        let mut got: Vec<u64> = Vec::new();
+        for _ in 0..100 {
+            if let Ok(data) = fs::read(&trace_path) {
+                if data.len() >= 12 {
+                    got = data[12..]
+                        .chunks_exact(8)
+                        .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+                        .collect();
+                    if got.len() >= want.len() {
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(got[..want.len()], want[..], "trace must match touch order");
+
+        // The serviced pages carry the volume content: the touch read the
+        // volume byte (page index) and wrote index+1 back, and that write
+        // landed on the memfd page the handler filled.
+        for &page in &[5u64, 2, 9, 0, 15] {
+            let p = (base + page * PAGE) as *const u8;
+            let v = unsafe { std::ptr::read_volatile(p) };
+            assert_eq!(v, page as u8 + 1, "page {page} content must come from the volume");
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

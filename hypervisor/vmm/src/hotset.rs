@@ -267,7 +267,6 @@ fn spawn_prewarm(
         .name("hotset-prewarm".to_string())
         .spawn(move || {
             let started = std::time::Instant::now();
-            let mut got = 0u64;
             // Phase 1: the exact-order prefix, one sequential walker. The
             // guest replays this very sequence, so staying ahead of it is
             // what makes the warm hit; parallel readers would only thrash
@@ -280,7 +279,6 @@ fn spawn_prewarm(
                     }
                     match pread_once(&file, offset, &mut page) {
                         Ok(n) if n == page.len() => {
-                            got += n as u64;
                             coord_done.fetch_add(n as u64, Ordering::Relaxed);
                         }
                         Ok(_) => {
@@ -370,7 +368,7 @@ fn spawn_prewarm(
             for join in joins {
                 let _ = join.join();
             }
-            got = coord_done.load(Ordering::Relaxed);
+            let got = coord_done.load(Ordering::Relaxed);
             let ms = started.elapsed().as_millis();
             if coord_incomplete.load(Ordering::Relaxed) {
                 warn!(
