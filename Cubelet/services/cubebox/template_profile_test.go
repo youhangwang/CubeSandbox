@@ -17,6 +17,8 @@ import (
 	"testing"
 
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/constants"
+	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/log"
+	"github.com/tencentcloud/CubeSandbox/pkgs/CubeLog"
 	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 )
 
@@ -258,7 +260,7 @@ func TestWriteHotPagesFileAtomicAndReadable(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "snapshot", HotPagesFileName)
 	extents := [][2]uint64{{0, 4096}, {8192, 4096}}
-	if err := writeHotPagesFile(path, "tpl-x", 1<<20, extents); err != nil {
+	if err := writeHotPagesFile(path, "tpl-x", 1<<20, HotPagesVersionV1, extents, nil); err != nil {
 		t.Fatalf("writeHotPagesFile: %v", err)
 	}
 	data, err := os.ReadFile(path)
@@ -269,11 +271,14 @@ func TestWriteHotPagesFileAtomicAndReadable(t *testing.T) {
 	if err := json.Unmarshal(data, &parsed); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if parsed.Version != HotPagesVersion || parsed.TemplateID != "tpl-x" || parsed.MemFileSize != 1<<20 {
+	if parsed.Version != HotPagesVersionV1 || parsed.TemplateID != "tpl-x" || parsed.MemFileSize != 1<<20 {
 		t.Fatalf("unexpected header: %+v", parsed)
 	}
 	if len(parsed.Extents) != 2 || parsed.Extents[0] != [2]uint64{0, 4096} {
 		t.Fatalf("unexpected extents: %v", parsed.Extents)
+	}
+	if len(parsed.PrefixPages) != 0 {
+		t.Fatalf("v1 profile must not carry prefix pages: %v", parsed.PrefixPages)
 	}
 	// no temp files left behind
 	entries, _ := os.ReadDir(filepath.Dir(path))
@@ -443,5 +448,68 @@ func TestResolveMapsDevRegularFile(t *testing.T) {
 	}
 	if _, ok := resolveMapsDev(filepath.Join(t.TempDir(), "missing")); ok {
 		t.Fatalf("identity must be refused for a missing path")
+	}
+}
+
+// ---- exact-order traces (version-2 profiles) ----
+
+func TestParseHotsetTrace(t *testing.T) {
+	data := make([]byte, 0, 12+16)
+	data = append(data, 'H', 'S', 'T', 'R')
+	var ver, ps [4]byte
+	binary.LittleEndian.PutUint32(ver[:], 1)
+	binary.LittleEndian.PutUint32(ps[:], 4096)
+	data = append(data, ver[:]...)
+	data = append(data, ps[:]...)
+	var off [8]byte
+	binary.LittleEndian.PutUint64(off[:], 8192)
+	data = append(data, off[:]...)
+	binary.LittleEndian.PutUint64(off[:], 4096)
+	data = append(data, off[:]...)
+
+	pages, err := parseHotsetTrace(data)
+	if err != nil {
+		t.Fatalf("parseHotsetTrace: %v", err)
+	}
+	if len(pages) != 2 || pages[0] != 2 || pages[1] != 1 {
+		t.Fatalf("unexpected pages: %v", pages)
+	}
+
+	data[0] = 'X'
+	if _, err := parseHotsetTrace(data); err == nil {
+		t.Fatal("expected bad-magic error")
+	}
+}
+
+func TestWriteOrderedProfile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "snapshot", HotPagesFileName)
+	// Round 0 touches pages in order 2,1,3; round 1 never touches 3, so the
+	// stable set is {1,2}: prefix replays round 0's order [2,1] and the
+	// range side is empty.
+	trace0 := []uint64{2, 1, 3}
+	trace1 := []uint64{1, 2}
+	stepLog := log.NewWrapperLogEntry(CubeLog.WithContext(context.Background()))
+	if err := writeOrderedProfile(path, "tpl-x", 1<<20, trace0, trace1, stepLog); err != nil {
+		t.Fatalf("writeOrderedProfile: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	var parsed hotPagesFile
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if parsed.Version != HotPagesVersionV2 {
+		t.Fatalf("expected v2, got %d", parsed.Version)
+	}
+	if len(parsed.PrefixPages) != 2 || parsed.PrefixPages[0] != 2 || parsed.PrefixPages[1] != 1 {
+		t.Fatalf("unexpected prefix: %v", parsed.PrefixPages)
+	}
+	// Pages 2 and 1 are covered by the prefix; page 3 is not stable and must
+	// not appear in the ranges.
+	if len(parsed.Extents) != 0 {
+		t.Fatalf("unexpected extents: %v", parsed.Extents)
 	}
 }

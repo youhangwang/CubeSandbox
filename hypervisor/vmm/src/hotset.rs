@@ -31,7 +31,16 @@ use serde::Deserialize;
 /// Profile files live in the template snapshot state dir, next to the
 /// `memory-ranges` file cube-runtime writes: `<pkg>/metadata/snapshot/`.
 const PROFILE_FILENAME: &str = "hot-pages.json";
-const SUPPORTED_VERSION: u32 = 1;
+/// Profile schema versions this consumer understands: 1 is extents-only;
+/// 2 adds an exact-order `prefix_pages` first-touch sequence recorded by
+/// hotset_record.rs, which is walked strictly in order before the ranges.
+const SUPPORTED_VERSION_MIN: u32 = 1;
+const SUPPORTED_VERSION_MAX: u32 = 2;
+/// Consumer-side sanity cap on the exact-order prefix (the producer caps
+/// far lower); anything larger is treated as corrupt.
+const MAX_PREFIX_PAGES: usize = 65536;
+/// Guest page size: the unit of the recorded first-touch prefix.
+const PAGE_SIZE: u64 = 4096;
 /// Runaway guard: prewarm reads at most 1/2 of the memory file. The worker
 /// count bounds the IO depth; concurrent creates on one device multiply the
 /// aggregate load.
@@ -99,10 +108,17 @@ struct HotPagesProfile {
     /// [offset, len] byte ranges into the memory file.
     #[serde(default)]
     extents: Vec<[u64; 2]>,
+    /// Version 2: the exact-order first-touch prefix recorded by
+    /// hotset_record.rs — page-aligned byte offsets in the order the guest
+    /// first touched them during the profiled boot. Walked strictly in
+    /// order before any range, so the warm tracks the guest's own fault
+    /// sequence.
+    #[serde(default)]
+    prefix_pages: Vec<u64>,
 }
 
 fn validate(profile: &HotPagesProfile, actual_size: u64) -> Result<(), String> {
-    if profile.version != SUPPORTED_VERSION {
+    if !(SUPPORTED_VERSION_MIN..=SUPPORTED_VERSION_MAX).contains(&profile.version) {
         return Err(format!("unsupported version {}", profile.version));
     }
     if profile.mem_file_size != actual_size {
@@ -130,6 +146,45 @@ fn validate(profile: &HotPagesProfile, actual_size: u64) -> Result<(), String> {
     if total * MAX_TOTAL_RATIO_DEN > actual_size * MAX_TOTAL_RATIO_NUM {
         return Err(format!(
             "extent total {total} exceeds half of memory size {actual_size}"
+        ));
+    }
+    // Exact-order prefix (version 2): page-aligned, in-bounds, deduplicated
+    // on consumption; its bytes add to the same half-volume cap. A version-1
+    // profile must not carry one — the field only has meaning when the
+    // recording path produced the manifest.
+    if profile.prefix_pages.is_empty() && profile.version == SUPPORTED_VERSION_MIN {
+        // plain v1: nothing further to check
+    } else if profile.version != SUPPORTED_VERSION_MAX {
+        return Err(format!(
+            "prefix pages require version {SUPPORTED_VERSION_MAX}, got {}",
+            profile.version
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for &page in &profile.prefix_pages {
+        if page % PAGE_SIZE != 0 {
+            return Err(format!("prefix page {page} not page-aligned"));
+        }
+        if page.checked_add(PAGE_SIZE).map(|end| end > actual_size) != Some(false) {
+            return Err(format!("prefix page {page} out of bounds"));
+        }
+        if !seen.insert(page) {
+            return Err(format!("duplicate prefix page {page}"));
+        }
+        total = total
+            .checked_add(PAGE_SIZE)
+            .ok_or_else(|| "prefix total overflow".to_string())?;
+    }
+    if profile.prefix_pages.len() > MAX_PREFIX_PAGES {
+        return Err(format!(
+            "prefix has {} pages, over the {} cap",
+            profile.prefix_pages.len(),
+            MAX_PREFIX_PAGES
+        ));
+    }
+    if total * MAX_TOTAL_RATIO_DEN > actual_size * MAX_TOTAL_RATIO_NUM {
+        return Err(format!(
+            "total {total} (extents + prefix) exceeds half of memory size {actual_size}"
         ));
     }
     Ok(())
@@ -182,96 +237,27 @@ fn split_chunks(extents: &[[u64; 2]]) -> Vec<[u64; 2]> {
     chunks
 }
 
-/// Run the prewarm walk on a pool of worker threads pulling chunk-sized work
-/// units from a shared queue. Returns the cancel guard and the coordinator's
-/// join handle (dropped by the caller; joined by tests). The coordinator
-/// joins the workers and logs the aggregate outcome, so the caller stays
-/// fire-and-forget.
+/// Run the prewarm walk: phase 1 walks the exact-order prefix pages strictly
+/// in recorded order (they replay the guest's own fault sequence), phase 2
+/// drains the merged ranges from a pool of worker threads pulling
+/// chunk-sized work units from a shared queue. Returns the cancel guard and
+/// the coordinator's join handle (dropped by the caller; joined by tests).
+/// The coordinator joins everything and logs the aggregate outcome, so the
+/// caller stays fire-and-forget.
 fn spawn_prewarm(
     file: File,
+    prefix: Vec<u64>,
     extents: Vec<[u64; 2]>,
     total: u64,
 ) -> io::Result<(PrewarmGuard, std::thread::JoinHandle<()>)> {
+    let prefix = Arc::new(prefix);
     let chunks = Arc::new(split_chunks(&extents));
     let nchunks = chunks.len();
+    let npages = prefix.len();
     let next = Arc::new(AtomicUsize::new(0));
     let cancel = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicU64::new(0));
     let incomplete = Arc::new(AtomicBool::new(false));
-
-    let mut joins = Vec::new();
-    for i in 0..worker_count() {
-        let worker_file = match file.try_clone() {
-            Ok(f) => f,
-            Err(e) => {
-                if joins.is_empty() {
-                    return Err(e);
-                }
-                debug!("restore memory hotset: worker {i} fd clone failed: {e}");
-                break;
-            }
-        };
-        let worker = {
-            let chunks = Arc::clone(&chunks);
-            let next = Arc::clone(&next);
-            let cancel = Arc::clone(&cancel);
-            let done = Arc::clone(&done);
-            let incomplete = Arc::clone(&incomplete);
-            move || {
-                let mut scratch = vec![0u8; PREAD_CHUNK_BYTES];
-                loop {
-                    if cancel.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    let idx = next.fetch_add(1, Ordering::Relaxed);
-                    if idx >= chunks.len() {
-                        return;
-                    }
-                    let [off, len] = chunks[idx];
-                    let mut pos = off;
-                    let mut left = len;
-                    while left > 0 {
-                        if cancel.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        let want = (left as usize).min(scratch.len());
-                        match pread_once(&worker_file, pos, &mut scratch[..want]) {
-                            Ok(n) if n == want => {
-                                done.fetch_add(n as u64, Ordering::Relaxed);
-                                pos += n as u64;
-                                left -= n as u64;
-                            }
-                            Ok(_) => {
-                                // EOF (should not happen: validate() bounds
-                                // extents by the file size). Give up; the
-                                // plain fault path covers the rest.
-                                incomplete.store(true, Ordering::Relaxed);
-                                return;
-                            }
-                            Err(e) => {
-                                debug!("restore memory hotset: pread at {pos} failed: {e}");
-                                incomplete.store(true, Ordering::Relaxed);
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-        };
-        match std::thread::Builder::new()
-            .name(format!("hotset-prewarm{i}"))
-            .spawn(worker)
-        {
-            Ok(join) => joins.push(join),
-            Err(e) => {
-                if joins.is_empty() {
-                    return Err(e);
-                }
-                debug!("restore memory hotset: worker {i} spawn failed: {e}");
-                break;
-            }
-        }
-    }
 
     let coord_cancel = Arc::clone(&cancel);
     let coord_done = Arc::clone(&done);
@@ -281,29 +267,128 @@ fn spawn_prewarm(
         .name("hotset-prewarm".to_string())
         .spawn(move || {
             let started = std::time::Instant::now();
+            let mut got = 0u64;
+            // Phase 1: the exact-order prefix, one sequential walker. The
+            // guest replays this very sequence, so staying ahead of it is
+            // what makes the warm hit; parallel readers would only thrash
+            // the device against the guest's own fault stream.
+            if !prefix.is_empty() {
+                let mut page = [0u8; PAGE_SIZE as usize];
+                for &offset in prefix.iter() {
+                    if coord_cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    match pread_once(&file, offset, &mut page) {
+                        Ok(n) if n == page.len() => {
+                            got += n as u64;
+                            coord_done.fetch_add(n as u64, Ordering::Relaxed);
+                        }
+                        Ok(_) => {
+                            coord_incomplete.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                        Err(e) => {
+                            debug!("restore memory hotset: prefix pread at {offset} failed: {e}");
+                            coord_incomplete.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                }
+            }
+            // Phase 2: the merged ranges, chunked across a worker pool.
+            let workers = worker_count();
+            let mut joins = Vec::new();
+            for i in 0..workers {
+                let worker_file = match file.try_clone() {
+                    Ok(f) => f,
+                    Err(e) => {
+                        debug!("restore memory hotset: worker {i} fd clone failed: {e}");
+                        break;
+                    }
+                };
+                let worker = {
+                    let chunks = Arc::clone(&chunks);
+                    let next = Arc::clone(&next);
+                    let cancel = Arc::clone(&coord_cancel);
+                    let done = Arc::clone(&coord_done);
+                    let incomplete = Arc::clone(&coord_incomplete);
+                    move || {
+                        let mut scratch = vec![0u8; PREAD_CHUNK_BYTES];
+                        loop {
+                            if cancel.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            let idx = next.fetch_add(1, Ordering::Relaxed);
+                            if idx >= chunks.len() {
+                                return;
+                            }
+                            let [off, len] = chunks[idx];
+                            let mut pos = off;
+                            let mut left = len;
+                            while left > 0 {
+                                if cancel.load(Ordering::Relaxed) {
+                                    return;
+                                }
+                                let want = (left as usize).min(scratch.len());
+                                match pread_once(&worker_file, pos, &mut scratch[..want]) {
+                                    Ok(n) if n == want => {
+                                        done.fetch_add(n as u64, Ordering::Relaxed);
+                                        pos += n as u64;
+                                        left -= n as u64;
+                                    }
+                                    Ok(_) => {
+                                        // EOF (should not happen: validate()
+                                        // bounds extents by the file size).
+                                        // Give up; the plain fault path
+                                        // covers the rest.
+                                        incomplete.store(true, Ordering::Relaxed);
+                                        return;
+                                    }
+                                    Err(e) => {
+                                        debug!(
+                                            "restore memory hotset: pread at {pos} failed: {e}"
+                                        );
+                                        incomplete.store(true, Ordering::Relaxed);
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+                match std::thread::Builder::new()
+                    .name(format!("hotset-prewarm{i}"))
+                    .spawn(worker)
+                {
+                    Ok(join) => joins.push(join),
+                    Err(e) => {
+                        debug!("restore memory hotset: worker {i} spawn failed: {e}");
+                        break;
+                    }
+                }
+            }
             for join in joins {
                 let _ = join.join();
             }
-            let got = coord_done.load(Ordering::Relaxed);
+            got = coord_done.load(Ordering::Relaxed);
             let ms = started.elapsed().as_millis();
             if coord_incomplete.load(Ordering::Relaxed) {
                 warn!(
-                    "restore memory hotset prewarm incomplete: {got} of {total} bytes in {nchunks} chunks, {ms} ms"
+                    "restore memory hotset prewarm incomplete: {got} of {total} bytes, {npages} prefix pages in {nchunks} chunks, {ms} ms"
                 );
             } else if coord_cancel.load(Ordering::Relaxed) {
                 debug!(
-                    "restore memory hotset prewarm cancelled after {got} of {total} bytes, {ms} ms"
+                    "restore memory hotset prewarm cancelled after {got} of {total} bytes, {npages} prefix pages in {nchunks} chunks, {ms} ms"
                 );
             } else {
                 info!(
-                    "restore memory hotset prewarm done: {got} bytes in {nchunks} chunks, {ms} ms"
+                    "restore memory hotset prewarm done: {got} bytes, {npages} prefix pages in {nchunks} chunks, {ms} ms"
                 );
             }
         })
         .map_err(|e| {
-            // The worker joins moved into the closure are dropped with it:
-            // cancel so the already-spawned workers stop instead of draining
-            // the whole profile uncancelled.
+            // The ranges moved into the closure are dropped with it: cancel
+            // so nothing keeps reading an uncancelled profile.
             guard_cancel.store(true, Ordering::Relaxed);
             e
         })?;
@@ -396,11 +481,17 @@ pub fn restore_prewarm(memory_file: &File, snapshot_dir: &Path) -> Option<Prewar
             return None;
         }
     };
-    match spawn_prewarm(worker_file, profile.extents.clone(), total) {
+    match spawn_prewarm(
+        worker_file,
+        profile.prefix_pages.clone(),
+        profile.extents.clone(),
+        total,
+    ) {
         Ok((guard, _coordinator)) => {
             info!(
-                "restore memory hotset prewarm kicked: {} extents, {} workers, {total} bytes",
+                "restore memory hotset prewarm kicked: {} extents, {} prefix pages, {} workers, {total} bytes",
                 profile.extents.len(),
+                profile.prefix_pages.len(),
                 worker_count()
             );
             Some(guard)
@@ -423,11 +514,12 @@ mod tests {
 
     fn profile(extents: &[[u64; 2]], mem_file_size: u64) -> HotPagesProfile {
         HotPagesProfile {
-            version: SUPPORTED_VERSION,
+            version: SUPPORTED_VERSION_MIN,
             template_id: "tpl-x".to_string(),
             mem_file_size,
             profiled_at: "2026-09-20T03:00:00Z".to_string(),
             extents: extents.to_vec(),
+            prefix_pages: Vec::new(),
         }
     }
 
@@ -436,6 +528,38 @@ mod tests {
         let _g = LOCK.lock().unwrap();
         let p = profile(&[[0, 4096], [8192, 4096]], 1 << 20);
         assert_eq!(validate(&p, 1 << 20), Ok(()));
+    }
+
+    #[test]
+    fn test_validate_accepts_v2_prefix() {
+        let _g = LOCK.lock().unwrap();
+        let mut p = profile(&[[8192, 4096]], 1 << 20);
+        p.version = SUPPORTED_VERSION_MAX;
+        p.prefix_pages = vec![0, 4096];
+        assert_eq!(validate(&p, 1 << 20), Ok(()));
+        // v1 profiles simply never carry a prefix.
+        let p1 = profile(&[[8192, 4096]], 1 << 20);
+        assert_eq!(validate(&p1, 1 << 20), Ok(()));
+    }
+
+    #[test]
+    fn test_validate_rejects_bad_prefix() {
+        let _g = LOCK.lock().unwrap();
+        let mut p = profile(&[], 1 << 20);
+        p.version = SUPPORTED_VERSION_MAX;
+        // unaligned
+        p.prefix_pages = vec![4095];
+        assert!(validate(&p, 1 << 20).is_err());
+        // out of bounds
+        p.prefix_pages = vec![1 << 20];
+        assert!(validate(&p, 1 << 20).is_err());
+        // duplicate
+        p.prefix_pages = vec![0, 0];
+        assert!(validate(&p, 1 << 20).is_err());
+        // v1 with a prefix payload is rejected on version first
+        let mut p1 = profile(&[], 1 << 20);
+        p1.prefix_pages = vec![0];
+        assert!(validate(&p1, 1 << 20).is_err());
     }
 
     #[test]
@@ -564,8 +688,13 @@ mod tests {
         let _g = LOCK.lock().unwrap();
         let dir = temp_dir_case("spawn");
         let mem = write_file(&dir.join("mem.bin"), &vec![0u8; 1 << 20]);
-        let (guard, coordinator) =
-            spawn_prewarm(mem.try_clone().unwrap(), vec![[0, 1 << 20]], 1 << 20).unwrap();
+        let (guard, coordinator) = spawn_prewarm(
+            mem.try_clone().unwrap(),
+            Vec::new(),
+            vec![[0, 1 << 20]],
+            1 << 20,
+        )
+        .unwrap();
         coordinator.join().unwrap();
         assert!(!guard.cancel.load(Ordering::Relaxed));
         fs::remove_dir_all(&dir).ok();
@@ -580,6 +709,7 @@ mod tests {
         let mem = write_file(&dir.join("mem.bin"), &vec![0u8; 64 << 20]);
         let (guard, coordinator) = spawn_prewarm(
             mem.try_clone().unwrap(),
+            Vec::new(),
             vec![[0, 64 << 20]],
             64 << 20,
         )

@@ -11,11 +11,18 @@ package cubebox
 // template is finalized for distribution: two verification sandboxes are
 // started from the brand-new template through the normal create path, and
 // the memory pages the restored guest touches between resume and ready are
-// collected from the VMM process (/proc/<pid>/maps + pagemap). The
-// intersection of the two rounds drops one-off page faults; the result is
-// merged into extents and written next to memory-ranges inside the package
-// metadata, where the VMM consumes it at fast-restore time to prewarm the
-// page cache (hypervisor/vmm/src/hotset.rs).
+// collected. The intersection of the two rounds drops one-off page faults;
+// the result is merged into extents and written next to memory-ranges
+// inside the package metadata, where the VMM consumes it at fast-restore
+// time to prewarm the page cache (hypervisor/vmm/src/hotset.rs).
+//
+// Two capture sources are supported. When the recording marker
+// (`hotset-record`) is present next to the profile, the verification VMMs
+// back guest RAM with a memfd+userfaultfd region (hotset_record.rs) and
+// write a first-touch trace file: the exact page sequence the guest
+// touched, which becomes the version-2 manifest's ordered prefix. Without
+// the marker (or when traces fail), the phase falls back to the original
+// /proc/<pid>/pagemap present-bit collection and a version-1 manifest.
 //
 // The phase is strictly optional and fail-open: any error — including the
 // overall budget running out — is returned to the caller, which logs a
@@ -51,8 +58,21 @@ const (
 	// HotPagesFileName is the profile file the VMM looks up inside the
 	// snapshot state dir (<meta>/snapshot/), next to memory-ranges.
 	HotPagesFileName = "hot-pages.json"
-	// HotPagesVersion is the profile schema version the consumer accepts.
-	HotPagesVersion = 1
+	// HotPagesVersionV1 is the extents-only profile schema (pagemap capture).
+	HotPagesVersionV1 = 1
+	// HotPagesVersionV2 adds the exact-order first-touch prefix recorded
+	// through the memfd+userfaultfd recording path.
+	HotPagesVersionV2 = 2
+
+	// HotsetRecordMarker asks the verification VMMs to record first-touch
+	// order; it exists only for the lifetime of the profiling phase.
+	HotsetRecordMarker = "hotset-record"
+	// HotsetRecordTracePrefix is the trace file name prefix the recording
+	// VMM writes (pid-suffixed) into the snapshot state dir.
+	HotsetRecordTracePrefix = "hotset-record.trace."
+	// hotsetTraceHeaderSize is the fixed trace header: magic + version +
+	// page size.
+	hotsetTraceHeaderSize = 12
 
 	// EnvTemplateProfileEnable turns the profiling phase on (default off).
 	EnvTemplateProfileEnable = "CUBE_TEMPLATE_PROFILE_ENABLE"
@@ -69,6 +89,9 @@ const (
 	// this point the profile costs more than it saves, and the phase fails
 	// open: the template publishes without a profile.
 	hotPagesMaxExtents = 4096
+	// hotPagesMaxPrefix caps the exact-order prefix: the strictly-ordered
+	// head of the first-touch sequence the consumer replays.
+	hotPagesMaxPrefix = 4096
 	// extentCoalescePages merges hot pages separated by small gaps so the
 	// extent list stays short.
 	extentCoalescePages = 16
@@ -107,20 +130,50 @@ func (s *service) runTemplateProfilePhase(
 	memFileSize uint64,
 ) error {
 	deadline := time.Now().Add(templateProfileBudget())
-	roundSets := make([]map[uint64]struct{}, 0, verifyRounds)
+	traceDir := filepath.Dir(profilePath)
+
+	// Ask the verification VMMs to record first-touch order: the marker
+	// exists only for this phase and is removed on every path. When it is
+	// present the rounds yield exact-order traces (v2 manifest); otherwise
+	// the phase falls back to pagemap sets (v1).
+	markerPath := filepath.Join(traceDir, HotsetRecordMarker)
+	if err := os.WriteFile(markerPath, nil, 0o644); err != nil {
+		stepLog.Warnf("template profile: recording marker write failed, pagemap-only capture: %v", err)
+		markerPath = ""
+	} else {
+		defer func() {
+			if err := os.Remove(markerPath); err != nil && !os.IsNotExist(err) {
+				stepLog.Warnf("template profile: recording marker remove failed: %v", err)
+			}
+		}()
+	}
+
+	rounds := make([]verificationRound, 0, verifyRounds)
 	for round := 0; round < verifyRounds; round++ {
 		remaining := time.Until(deadline)
 		if remaining <= minRoundBudget {
 			return fmt.Errorf("budget exhausted after %d/%d rounds", round, verifyRounds)
 		}
-		set, err := s.profileVerificationRound(ctx, stepLog, createReq, backend, templateID, round, remaining)
+		r, err := s.profileVerificationRound(ctx, stepLog, createReq, backend, templateID, round, remaining, traceDir, markerPath != "")
 		if err != nil {
 			return fmt.Errorf("verification round %d: %w", round, err)
 		}
-		roundSets = append(roundSets, set)
+		rounds = append(rounds, *r)
 	}
 
-	pages := intersectPageSets(roundSets)
+	// Exact-order capture: both rounds recorded a first-touch trace, so the
+	// manifest carries an ordered prefix (round-0 order filtered to the
+	// pages both rounds touched) plus the merged ranges of the stable set.
+	if len(rounds[0].tracePages) > 0 && len(rounds[1].tracePages) > 0 {
+		return writeOrderedProfile(
+			profilePath, templateID, memFileSize,
+			rounds[0].tracePages, rounds[1].tracePages,
+			stepLog,
+		)
+	}
+
+	// Version-1 fallback: pagemap present-bit sets.
+	pages := intersectPageSets([]map[uint64]struct{}{rounds[0].pages, rounds[1].pages})
 	if len(pages) == 0 {
 		return errors.New("empty page intersection across rounds")
 	}
@@ -128,20 +181,29 @@ func (s *service) runTemplateProfilePhase(
 	if err := checkHotProfileCaps(extents, totalBytes, memFileSize); err != nil {
 		return err
 	}
-	if err := writeHotPagesFile(profilePath, templateID, memFileSize, extents); err != nil {
+	if err := writeHotPagesFile(profilePath, templateID, memFileSize, HotPagesVersionV1, extents, nil); err != nil {
 		return fmt.Errorf("write profile: %w", err)
 	}
-	stepLog.Infof("template profile: wrote %s: %d extents, %d pages, %d bytes (%.1f%% of memory)",
+	stepLog.Infof("template profile: wrote %s (v1): %d extents, %d pages, %d bytes (%.1f%% of memory)",
 		profilePath, len(extents), len(pages), totalBytes,
 		float64(totalBytes)/float64(memFileSize)*100)
 	return nil
 }
 
+// verificationRound is one verification restore's capture result. Exactly
+// one of the two sources is populated: tracePages (exact order, from the
+// recording VMM) or pages (pagemap present set).
+type verificationRound struct {
+	pages      map[uint64]struct{}
+	tracePages []uint64
+}
+
 // profileVerificationRound starts one verification sandbox from the new
 // template through the normal create path, waits for it to become ready
-// (Create returns), collects the touched page set from the VMM process and
-// destroys the sandbox best-effort on every path: Create is not atomic, and
-// a failed create can still leave the sandbox behind.
+// (Create returns), collects the touched page set (exact-order trace when
+// recording is on, pagemap otherwise) and destroys the sandbox best-effort
+// on every path: Create is not atomic, and a failed create can still leave
+// the sandbox behind.
 func (s *service) profileVerificationRound(
 	ctx context.Context,
 	stepLog *log.CubeWrapperLogEntry,
@@ -149,7 +211,8 @@ func (s *service) profileVerificationRound(
 	backend, templateID string,
 	round int,
 	budget time.Duration,
-) (map[uint64]struct{}, error) {
+	traceDir string, recording bool,
+) (*verificationRound, error) {
 	verifyReq, err := buildProfileVerifyRequest(createReq, templateID, round)
 	if err != nil {
 		return nil, err
@@ -210,13 +273,26 @@ func (s *service) profileVerificationRound(
 	}
 	roundLog.Infof("verification sandbox created: %s", sandboxID)
 
-	// Always destroy the verification sandbox, even when collection failed.
+	// Recording mode: the VMM's guest RAM is a memfd (the volume path is
+	// deliberately not mapped, so pagemap collection cannot match), and the
+	// trace is only complete once the recording handler exits with the VM.
+	// Destroy first, then read the trace. Pagemap mode: collect from the
+	// live process first — destroying loses the mapping.
+	if recording {
+		destroyRoundSandbox()
+		tracePages, traceErr := collectVerificationTrace(traceDir, roundLog)
+		if traceErr != nil {
+			return nil, traceErr
+		}
+		return &verificationRound{tracePages: tracePages}, nil
+	}
+
 	pages, collectErr := s.collectVerificationPageset(verifyCtx, roundLog, backend, templateID, sandboxID)
 	destroyRoundSandbox()
 	if collectErr != nil {
 		return nil, collectErr
 	}
-	return pages, nil
+	return &verificationRound{pages: pages}, nil
 }
 
 // buildProfileVerifyRequest derives a template-restore create request from
@@ -498,6 +574,139 @@ func parsePresentPageset(ctx context.Context, mapsData string, pagemap io.ReadSe
 	return pages, nil
 }
 
+// hotsetTraceHeader is the fixed header of a first-touch trace file
+// (hypervisor/vmm/src/hotset_record.rs): magic "HSTR", little-endian u32
+// version, little-endian u32 page size — then u64 little-endian volume
+// offsets in exact first-touch order.
+type hotsetTraceHeader struct {
+	Magic    [4]byte
+	Version  uint32
+	PageSize uint32
+}
+
+// collectVerificationTrace reads and removes every trace file the recording
+// VMM left in the snapshot state dir for this round, returning the ordered
+// page numbers (in memory-file page units).
+func collectVerificationTrace(traceDir string, stepLog *log.CubeWrapperLogEntry) ([]uint64, error) {
+	matches, err := filepath.Glob(filepath.Join(traceDir, HotsetRecordTracePrefix+"*"))
+	if err != nil {
+		return nil, fmt.Errorf("glob traces: %w", err)
+	}
+	if len(matches) == 0 {
+		return nil, errors.New("no recording trace found")
+	}
+	var pages []uint64
+	for _, path := range matches {
+		data, err := os.ReadFile(path) // NOCC:Path Traversal()
+		if err != nil {
+			return nil, fmt.Errorf("read trace %s: %w", path, err)
+		}
+		parsed, err := parseHotsetTrace(data)
+		if err != nil {
+			return nil, fmt.Errorf("parse trace %s: %w", path, err)
+		}
+		pages = append(pages, parsed...)
+		if err := os.Remove(path); err != nil {
+			stepLog.Warnf("template profile: trace %s remove failed: %v", path, err)
+		}
+	}
+	stepLog.Infof("collected %d first-touch pages from %d recording trace(s)", len(pages), len(matches))
+	return pages, nil
+}
+
+// parseHotsetTrace validates the trace header and decodes the ordered page
+// offsets. Split from collectVerificationTrace for unit tests.
+func parseHotsetTrace(data []byte) ([]uint64, error) {
+	if len(data) < hotsetTraceHeaderSize {
+		return nil, errors.New("trace shorter than header")
+	}
+	var header hotsetTraceHeader
+	copy(header.Magic[:], data[:4])
+	if string(header.Magic[:]) != "HSTR" {
+		return nil, errors.New("bad trace magic")
+	}
+	if header.Version = binary.LittleEndian.Uint32(data[4:8]); header.Version != 1 {
+		return nil, fmt.Errorf("unsupported trace version %d", header.Version)
+	}
+	if header.PageSize = binary.LittleEndian.Uint32(data[8:12]); header.PageSize == 0 {
+		return nil, errors.New("zero trace page size")
+	}
+	body := data[hotsetTraceHeaderSize:]
+	if len(body)%8 != 0 {
+		return nil, errors.New("trace body is not u64-aligned")
+	}
+	pages := make([]uint64, 0, len(body)/8)
+	for i := 0; i < len(body); i += 8 {
+		pages = append(pages, binary.LittleEndian.Uint64(body[i:])/uint64(header.PageSize))
+	}
+	return pages, nil
+}
+
+// writeOrderedProfile builds the version-2 manifest from two first-touch
+// traces: the prefix replays round 0's exact touch order filtered to pages
+// both rounds touched (stable, ordered head), and the merged ranges carry
+// the remaining stable pages. Ranges exclude prefix pages so the consumer's
+// two phases never double-read.
+func writeOrderedProfile(
+	path, templateID string, memFileSize uint64,
+	trace0, trace1 []uint64,
+	stepLog *log.CubeWrapperLogEntry,
+) error {
+	if len(trace0) == 0 || len(trace1) == 0 {
+		return errors.New("ordered profile requires non-empty traces")
+	}
+	stable0 := make(map[uint64]struct{}, len(trace0))
+	for _, page := range trace0 {
+		stable0[page] = struct{}{}
+	}
+	stable1 := make(map[uint64]struct{}, len(trace1))
+	for _, page := range trace1 {
+		stable1[page] = struct{}{}
+	}
+
+	// Prefix: round 0's order, kept only where round 1 agrees, capped.
+	var prefix []uint64
+	prefixSet := make(map[uint64]struct{}, hotPagesMaxPrefix)
+	for _, page := range trace0 {
+		if len(prefix) >= hotPagesMaxPrefix {
+			break
+		}
+		if _, ok := stable1[page]; !ok {
+			continue
+		}
+		if _, ok := prefixSet[page]; ok {
+			continue
+		}
+		prefixSet[page] = struct{}{}
+		prefix = append(prefix, page)
+	}
+	// Ranges: the rest of the stable set, prefix pages excluded.
+	stable := intersectPageSets([]map[uint64]struct{}{stable0, stable1})
+	for page := range prefixSet {
+		delete(stable, page)
+	}
+	if len(stable) == 0 && len(prefix) == 0 {
+		return errors.New("empty ordered profile intersection")
+	}
+	extents, totalBytes := mergeHotExtents(stable, extentCoalescePages, memFileSize)
+	if len(prefix) > hotPagesMaxPrefix || len(extents) > hotPagesMaxExtents {
+		return fmt.Errorf("ordered profile over caps: %d prefix pages, %d extents",
+			len(prefix), len(extents))
+	}
+	prefixBytes := uint64(len(prefix)) * uint64(os.Getpagesize())
+	if (totalBytes+prefixBytes)*hotPagesMaxTotalDen > memFileSize {
+		return fmt.Errorf("profile total %d bytes exceeds 1/%d of memory size %d",
+			totalBytes+prefixBytes, hotPagesMaxTotalDen, memFileSize)
+	}
+	if err := writeHotPagesFile(path, templateID, memFileSize, HotPagesVersionV2, extents, prefix); err != nil {
+		return fmt.Errorf("write profile: %w", err)
+	}
+	stepLog.Infof("template profile: wrote %s (v2): %d prefix pages, %d extents, %d bytes (%.1f%% of memory)",
+		path, len(prefix), len(extents), totalBytes+prefixBytes,
+		float64(totalBytes+prefixBytes)/float64(memFileSize)*100)
+	return nil
+}
+
 // intersectPageSets keeps only pages present in every round.
 func intersectPageSets(sets []map[uint64]struct{}) map[uint64]struct{} {
 	if len(sets) == 0 {
@@ -582,27 +791,30 @@ func checkHotProfileCaps(extents [][2]uint64, totalBytes, memFileSize uint64) er
 }
 
 // hotPagesFile is the profile schema consumed by hypervisor/vmm hotset.rs.
+// PrefixPages is set only on version-2 profiles (exact-order first touches).
 type hotPagesFile struct {
 	Version     int         `json:"version"`
 	TemplateID  string      `json:"template_id"`
 	MemFileSize uint64      `json:"mem_file_size"`
 	ProfiledAt  string      `json:"profiled_at"`
 	Extents     [][2]uint64 `json:"extents"`
+	PrefixPages []uint64    `json:"prefix_pages,omitempty"`
 }
 
 // writeHotPagesFile atomically writes the profile (temp file + rename) so a
 // consumer never observes a partial file.
-func writeHotPagesFile(path, templateID string, memFileSize uint64, extents [][2]uint64) error {
+func writeHotPagesFile(path, templateID string, memFileSize uint64, version int, extents [][2]uint64, prefixPages []uint64) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create profile dir: %w", err)
 	}
 	payload, err := json.Marshal(hotPagesFile{
-		Version:     HotPagesVersion,
+		Version:     version,
 		TemplateID:  templateID,
 		MemFileSize: memFileSize,
 		ProfiledAt:  time.Now().UTC().Format(time.RFC3339),
 		Extents:     extents,
+		PrefixPages: prefixPages,
 	})
 	if err != nil {
 		return fmt.Errorf("marshal profile: %w", err)
