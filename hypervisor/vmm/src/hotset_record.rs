@@ -41,6 +41,9 @@ use crate::GuestRegionMmap;
 const MARKER_FILE: &str = "hotset-record";
 /// Trace files, pid-suffixed so the two profiling rounds never collide.
 const TRACE_PREFIX: &str = "hotset-record.trace.";
+/// Debug milestones, pid-suffixed: the recorder runs in the shim whose
+/// stdio is discarded, so its own decisions land in a file instead.
+const DEBUG_PREFIX: &str = "hotset-record.debug.";
 const TRACE_MAGIC: &[u8; 4] = b"HSTR";
 const TRACE_VERSION: u32 = 1;
 
@@ -59,14 +62,17 @@ const SYS_USERFAULTFD: libc::c_long = 282;
 const SYS_USERFAULTFD: libc::c_long = 323;
 
 // userfaultfd ioctl numbers: stable kernel ABI, spelled out here so no
-// extra crate is needed. Sizes: uffdio_api=24, uffdio_register=32,
-// uffdio_copy=40; _IOWR(0xAA, nr, size).
+// extra crate is needed. _UFFDIO_REGISTER=0x00, _UFFDIO_COPY=0x03,
+// _UFFDIO_API=0x3f; sizes: register=32, copy=40, api=24;
+// _IOWR(0xAA, nr, size).
 const UFFD_API: u64 = 0xAA;
+/// MISSING mode on shmem/memfd mappings must be negotiated at the API
+/// handshake, or UFFDIO_REGISTER rejects the range with EINVAL.
+const UFFD_FEATURE_MISSING_SHMEM: u64 = 1 << 1;
 const UFFDIO_REGISTER_MODE_MISSING: u64 = 1 << 0;
-const UFFD_EVENT_PAGEFAULT: u8 = 1;
 pub(crate) const UFFDIO_API_IOCTL: libc::c_ulong = 0xc018_aa3f;
-pub(crate) const UFFDIO_REGISTER_IOCTL: libc::c_ulong = 0xc020_aa20;
-pub(crate) const UFFDIO_COPY_IOCTL: libc::c_ulong = 0xc028_aa32;
+pub(crate) const UFFDIO_REGISTER_IOCTL: libc::c_ulong = 0xc020_aa00;
+pub(crate) const UFFDIO_COPY_IOCTL: libc::c_ulong = 0xc028_aa03;
 
 #[repr(C)]
 struct UffdioApi {
@@ -124,7 +130,26 @@ struct Recorder {
     memfd: File,
     /// Taken by the handler thread at spawn; the only trace writer.
     trace: Mutex<Option<File>>,
+    /// Debug milestones for the on-host troubleshooting file.
+    debug: Mutex<Option<File>>,
     regions: Mutex<Vec<RecordedRegion>>,
+}
+
+/// dbg appends one line to the debug milestone file (best-effort).
+fn dbg(recorder: &Recorder, line: &str) {
+    if let Some(mut f) = recorder
+        .debug
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_mut()
+    {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = writeln!(f, "[{ts}] {line}");
+        let _ = f.flush();
+    }
 }
 
 static RECORDER: OnceLock<Arc<Recorder>> = OnceLock::new();
@@ -132,6 +157,17 @@ static RECORDER: OnceLock<Arc<Recorder>> = OnceLock::new();
 /// True when this process is recording first touches. Cheap, lock-free.
 pub fn active() -> bool {
     RECORDER.get().is_some()
+}
+
+impl Recorder {
+    /// True when `addr` falls inside any registered region.
+    fn contains(&self, addr: u64) -> bool {
+        self.regions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .any(|r| addr >= r.host_addr && addr < r.host_addr + r.len)
+    }
 }
 
 /// Activate recording when the snapshot state dir carries the marker file.
@@ -146,6 +182,13 @@ pub fn activate_if_requested(snapshot_dir: &Path, volume_path: &Path) -> Result<
         return Ok(());
     }
     let trace_path: PathBuf = snapshot_dir.join(format!("{TRACE_PREFIX}{}", std::process::id()));
+    let debug_path: PathBuf = snapshot_dir.join(format!("{DEBUG_PREFIX}{}", std::process::id()));
+    let debug = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&debug_path)
+        .map_err(|e| format!("open debug {}: {e}", debug_path.display()))?;
     let volume = File::open(volume_path).map_err(|e| format!("open volume: {e}"))?;
     let mut trace = fs::OpenOptions::new()
         .create(true)
@@ -159,14 +202,16 @@ pub fn activate_if_requested(snapshot_dir: &Path, volume_path: &Path) -> Result<
         .and_then(|_| trace.write_all(&(PAGE as u32).to_le_bytes()))
         .map_err(|e| format!("write trace header: {e}"))?;
 
-    let fd = unsafe { libc::syscall(SYS_USERFAULTFD, libc::O_CLOEXEC) };
+    let fd = unsafe { libc::syscall(SYS_USERFAULTFD, 0) };
     if fd < 0 {
         return Err(format!("userfaultfd syscall failed: {}", io_err()));
     }
     let uffd_fd = fd as i32;
     let mut api = UffdioApi {
         api: UFFD_API,
-        features: 0,
+        // The guest RAM region is a memfd (shmem): MISSING mode registration
+        // on shmem is only accepted when the feature is negotiated here.
+        features: UFFD_FEATURE_MISSING_SHMEM,
         ioctls: 0,
     };
     if unsafe { libc::ioctl(uffd_fd, UFFDIO_API_IOCTL, &mut api) } != 0 {
@@ -202,6 +247,7 @@ pub fn activate_if_requested(snapshot_dir: &Path, volume_path: &Path) -> Result<
         uffd_fd,
         volume,
         memfd,
+        debug: Mutex::new(Some(debug)),
         trace: Mutex::new(Some(trace)),
         regions: Mutex::new(Vec::new()),
     });
@@ -264,12 +310,22 @@ pub fn register_region(region: &GuestRegionMmap, volume_offset: u64) {
         ioctls: 0,
     };
     if unsafe { libc::ioctl(recorder.uffd_fd, UFFDIO_REGISTER_IOCTL, &mut reg) } != 0 {
+        dbg(
+            recorder,
+            &format!("REGISTER FAILED at {host_addr:#x} len {len}: {}", io_err()),
+        );
         warn!(
             "hotset record: UFFDIO_REGISTER failed at {host_addr:#x}: {}",
             io_err()
         );
         return;
     }
+    dbg(
+        recorder,
+        &format!(
+            "REGISTER ok at {host_addr:#x} len {len} vol_off {volume_offset}"
+        ),
+    );
     recorder
         .regions
         .lock()
@@ -292,12 +348,45 @@ pub fn register_region(region: &GuestRegionMmap, volume_offset: u64) {
             warn!("hotset record: handler not started, trace already taken");
             return;
         };
+        // Private dups of the uffd and volume fds: VM assembly churns open
+        // fd numbers, and a closed-and-reused number would silently point
+        // the handler at some other stream (observed: ttrpc frames). A dup
+        // keeps the open file description alive regardless.
+        let uffd_fd = unsafe { libc::dup(recorder.uffd_fd) };
+        let volume_fd = unsafe { libc::dup(recorder.volume.as_raw_fd()) };
+        if uffd_fd < 0 || volume_fd < 0 {
+            warn!("hotset record: fd dup failed");
+            unsafe {
+                if uffd_fd >= 0 {
+                    libc::close(uffd_fd);
+                }
+                if volume_fd >= 0 {
+                    libc::close(volume_fd);
+                }
+            }
+            return;
+        }
         let handler = Handler {
             recorder: Arc::clone(recorder),
             trace,
             buf: Vec::with_capacity(TRACE_FLUSH_RECORDS * 8),
-            msgs: vec![0u8; UFFD_MSG_SIZE * UFFD_MSG_BATCH],
+            msgs: vec![0u8; UFFD_MSG_BATCH * 32],
+            layout: None,
+            faults: 0,
         };
+        let (u, v) = (uffd_fd, volume_fd);
+        dbg(
+            &recorder,
+            &format!(
+                "handler fds: uffd={u} -> {}  volume={v} -> {}",
+                std::fs::read_link(format!("/proc/self/fd/{u}"))
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|e| format!("gone({e})")),
+                std::fs::read_link(format!("/proc/self/fd/{v}"))
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|e| format!("gone({e})")),
+            ),
+        );
         if let Err(e) = std::thread::Builder::new()
             .name("hotset-record".to_string())
             .spawn(move || handler.run())
@@ -315,11 +404,18 @@ struct Handler {
     trace: File,
     buf: Vec<u8>,
     msgs: Vec<u8>,
+    /// Message layout (stride, address offset) — differs by kernel version
+    /// (24/8 pre pagefault-flags, 32/16 after) and is auto-detected from the
+    /// first event: the fault address must land inside a registered region,
+    /// while the wrong candidate reads the (zero) flags field.
+    layout: Option<(usize, usize)>,
+    faults: u64,
 }
 
 impl Handler {
     fn run(mut self) {
         info!("hotset record: handler started");
+        dbg(&self.recorder, "handler started");
         loop {
             let n = unsafe {
                 libc::read(
@@ -333,25 +429,71 @@ impl Handler {
             }
             if n <= 0 {
                 info!("hotset record: handler exiting ({n})");
+                dbg(&self.recorder, &format!("handler exiting ({n})"));
                 break;
             }
+            let bytes = n as usize;
+            if self.layout.is_none() {
+                // Detect once from the batch head. The upstream layout is
+                // (stride 24, address @8); this vendor kernel delivers
+                // (stride 32, address @16) and its first byte is NOT the
+                // upstream event value — so the candidates are matched by
+                // region membership of the address, not by the event byte.
+                let detected = self.detect_layout(bytes);
+                let head: String = self.msgs[..40.min(bytes)]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                dbg(
+                    &self.recorder,
+                    &format!("first batch {bytes}B head={head} layout={detected:?}"),
+                );
+                self.layout = Some(detected);
+            }
+            let (stride, addr_at) = self.layout.unwrap();
             // Collect first: handle_fault needs &mut self for the trace
-            // buffer, and the msgs slice borrows self immutably.
-            let mut faults = Vec::with_capacity(n as usize / UFFD_MSG_SIZE);
-            for chunk in self.msgs[..n as usize].chunks_exact(UFFD_MSG_SIZE) {
-                if chunk[0] != UFFD_EVENT_PAGEFAULT {
-                    continue;
-                }
-                faults.push(u64::from_le_bytes(chunk[8..16].try_into().expect("24-byte msg")));
+            // buffer, and the msgs slice borrows self immutably. The event
+            // byte is vendor-specific (0x12 here vs upstream 1) — records
+            // are validated by address containment inside handle_fault, so
+            // unrelated records simply miss and are dropped.
+            let mut faults = Vec::with_capacity(bytes / stride + 1);
+            let mut pos = 0usize;
+            while pos + stride <= bytes {
+                let chunk = &self.msgs[pos..pos + stride];
+                faults.push(u64::from_le_bytes(
+                    chunk[addr_at..addr_at + 8].try_into().unwrap(),
+                ));
+                pos += stride;
             }
             for addr in faults {
                 self.handle_fault(addr);
+            }
+            self.faults += 1;
+            if self.faults % 65536 == 0 {
+                let (batches, buf_len) = (self.faults, self.buf.len());
+                dbg(&self.recorder, &format!("progress: {batches} batches, buf {buf_len}B"));
             }
             // Flush per batch: the trace consumer (cubelet) reads after the
             // VM is destroyed, and this keeps the tail loss at one batch.
             self.flush();
         }
-        self.flush();
+    }
+
+    fn detect_layout(&self, bytes: usize) -> (usize, usize) {
+        // This vendor kernel's first byte is not the upstream event value,
+        // so candidates are matched purely by address containment.
+        for candidate in [(32usize, 16usize), (24usize, 8usize)] {
+            let (stride, addr_at) = candidate;
+            if bytes >= stride {
+                let addr = u64::from_le_bytes(
+                    self.msgs[addr_at..addr_at + 8].try_into().unwrap(),
+                );
+                if addr != 0 && self.recorder.contains(addr) {
+                    return candidate;
+                }
+            }
+        }
+        (32, 16)
     }
 
     /// Resolve one fault: pread the page from the memory volume, UFFDIO_COPY
@@ -369,6 +511,9 @@ impl Handler {
             .iter()
             .find(|r| page_addr >= r.host_addr && page_addr < r.host_addr + r.len)
         else {
+            if self.faults < 3 {
+                dbg(&self.recorder, &format!("FAULT MISS addr={page_addr:#x}"));
+            }
             return;
         };
         let vol_off = region.volume_offset + (page_addr - region.host_addr);
@@ -376,7 +521,10 @@ impl Handler {
 
         let mut page = [0u8; PAGE as usize];
         if !pread_full(self.recorder.volume.as_raw_fd(), &mut page, vol_off) {
-            warn!("hotset record: pread volume at {vol_off} failed");
+            dbg(
+                &self.recorder,
+                &format!("PREAD FAIL vol_off={vol_off}: {}", io_err()),
+            );
             return;
         }
         let mut copy = UffdioCopy {
@@ -387,11 +535,21 @@ impl Handler {
             copy: 0,
         };
         if unsafe { libc::ioctl(self.recorder.uffd_fd, UFFDIO_COPY_IOCTL, &mut copy) } != 0 {
+            let err = io_err();
+            if self.faults < 3 {
+                dbg(
+                    &self.recorder,
+                    &format!("COPY FAIL dst={page_addr:#x}: {err}"),
+                );
+            }
             warn!(
                 "hotset record: UFFDIO_COPY failed at {page_addr:#x}: {}",
-                io_err()
+                err
             );
             return;
+        }
+        if self.faults < 3 {
+            dbg(&self.recorder, &format!("COPY OK dst={page_addr:#x}"));
         }
         self.buf.extend_from_slice(&vol_off.to_le_bytes());
     }
