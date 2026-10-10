@@ -55,6 +55,13 @@ const MAX_WORKERS: usize = 64;
 /// Number of prewarm worker threads; 1 restores the sequential behavior.
 const ENV_HOTSET_WORKERS: &str = "CUBE_VMM_RESTORE_HOTSET_QD";
 
+/// Opt-in approximate-order consumption: CUBE_VMM_RESTORE_HOTSET_ORDER=chunk
+/// sorts the merged 1MiB chunks by the earliest recorded first-touch page
+/// each contains, so a low-QD drain sweeps the disk in roughly the guest's
+/// boot order at chunk granularity. Unset or any other value keeps the
+/// address-ordered pool.
+const ENV_HOTSET_ORDER: &str = "CUBE_VMM_RESTORE_HOTSET_ORDER";
+
 fn worker_count() -> usize {
     match std::env::var(ENV_HOTSET_WORKERS) {
         Ok(v) => v
@@ -237,6 +244,32 @@ fn split_chunks(extents: &[[u64; 2]]) -> Vec<[u64; 2]> {
     chunks
 }
 
+/// Sort the 1MiB chunks by the earliest recorded first-touch page they
+/// contain (see ENV_HOTSET_ORDER). Chunks with no recorded page keep their
+/// address order and drain after all ordered ones (stable sort). The seek
+/// count collapses to roughly one per extent instead of one per worker
+/// jump, while the reads stay 1MiB-merged. Returns whether the ordering
+/// was applied.
+fn order_chunks_by_prefix(chunks: &mut [[u64; 2]], prefix: &[u64]) -> bool {
+    if std::env::var(ENV_HOTSET_ORDER).as_deref() != Ok("chunk") {
+        return false;
+    }
+    let rank: std::collections::HashMap<u64, u32> = prefix
+        .iter()
+        .enumerate()
+        .map(|(i, &off)| (off / PAGE_SIZE, i as u32))
+        .collect();
+    chunks.sort_by_key(|[off, len]| {
+        (0..*len)
+            .step_by(PAGE_SIZE as usize)
+            .filter_map(|d| rank.get(&((off + d) / PAGE_SIZE)))
+            .copied()
+            .min()
+            .unwrap_or(u32::MAX)
+    });
+    true
+}
+
 /// Run the prewarm walk from a pool of worker threads pulling chunk-sized
 /// work units from a shared queue. The recorded prefix pages are folded
 /// into the extent pool and merged: on seek-bound storage a 4K-granular
@@ -271,8 +304,10 @@ fn spawn_prewarm(
         }
     }
     let prefix_pages = prefix.len();
-    let chunks = Arc::new(split_chunks(&merged));
+    let mut chunks = split_chunks(&merged);
+    order_chunks_by_prefix(&mut chunks, &prefix);
     let nchunks = chunks.len();
+    let chunks = Arc::new(chunks);
     let next = Arc::new(AtomicUsize::new(0));
     let cancel = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicU64::new(0));
@@ -673,6 +708,27 @@ mod tests {
         assert_eq!(worker_count(), DEFAULT_WORKERS);
         std::env::remove_var(ENV_HOTSET_WORKERS);
         assert_eq!(worker_count(), DEFAULT_WORKERS);
+    }
+
+    #[test]
+    fn test_order_chunks_by_prefix_follows_first_touch() {
+        let _g = LOCK.lock().unwrap();
+        let meg = PREAD_CHUNK_BYTES as u64;
+        // address order: [0..1M), [1M..2M), [2M..3M)
+        let mut chunks: Vec<[u64; 2]> = vec![[0, meg], [meg, meg], [2 * meg, meg]];
+        // first touch: one page in chunk 2, then one in chunk 0; chunk 1 untouched
+        let prefix = vec![2 * meg, 0];
+        std::env::set_var(ENV_HOTSET_ORDER, "chunk");
+        assert!(order_chunks_by_prefix(&mut chunks, &prefix));
+        std::env::remove_var(ENV_HOTSET_ORDER);
+        assert_eq!(chunks[0][0], 2 * meg);
+        assert_eq!(chunks[1][0], 0);
+        // untouched chunk keeps address order and drains after the ordered ones
+        assert_eq!(chunks[2][0], meg);
+        // opt-out keeps address order
+        let mut chunks: Vec<[u64; 2]> = vec![[0, meg], [meg, meg]];
+        assert!(!order_chunks_by_prefix(&mut chunks, &prefix));
+        assert_eq!(chunks[0][0], 0);
     }
 
     #[test]
