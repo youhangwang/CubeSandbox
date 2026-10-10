@@ -289,6 +289,12 @@ func (s *service) Create(ctx context.Context, req *cubebox.RunCubeSandboxRequest
 
 	ctx = context.WithValue(ctx, workflow.KCreateContext, createInfo)
 
+	// Fire-and-forget page-cache prewarm for restore-from-template creates:
+	// bulk-read the template volumes now, before any VM assembly, so the
+	// reads overlap with the restore and a request that arrived ahead of
+	// the create finds the cache already hot. See create_keepwarm.go.
+	s.kickCreateKeepWarm(ctx, createInfo)
+
 	rt := &CubeLog.RequestTrace{
 		Action:       "Create",
 		RequestID:    req.RequestID,
