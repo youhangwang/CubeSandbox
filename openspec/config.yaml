@@ -1,0 +1,41 @@
+schema: spec-driven
+
+# Project context (optional)
+# This is shown to AI when creating artifacts.
+# Add your tech stack, conventions, style guides, domain knowledge, etc.
+context: |
+  CubeSandbox：sandbox 即 KVM microVM（cube-hypervisor，cloud-hypervisor fork，Rust）。
+  组件：CubeAPI(Rust REST) → CubeMaster(Go 调度/quota 门) → Cubelet(Go 节点代理,
+  cgroup/资源账本) → containerd → CubeShim(Rust shim v2, 进程内起 VMM) → guest agent(Kata 衍生)。
+  资源货币：ResourceWithOverHead.HostMemQ（含 VMM 开销的承诺值）；节点配额 = 物理内存 × 5/4
+  （cubelet 自报）；全局管道无实测内存准入。cgroup v1/v2 双池并存，v2 按 NUMA node 分组
+  （MakeFullCgID 高 16 位 = node），由 use_pool_v2 开关选择。
+  模板 = CommitSandbox 产出的 VM 内存快照，新 sandbox 恢复（惰性映射）而非冷启。
+  文档语言：中文正文 + 英文代码标识符。
+# Example:
+#   context: |
+#     Tech stack: TypeScript, React, Node.js
+#     We use conventional commits
+#     Domain: e-commerce platform
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always include a "Non-goals" section
+#     tasks:
+#       - Break tasks into chunks of max 2 hours
+
+# Per-operation guidance (optional)
+# Add advisory guidance for how apply and archive work should be conducted.
+# This is separate from artifact rules above.
+# Example:
+#   operations:
+#     apply:
+#       guidance:
+#         - Keep test summaries concise
+#     archive:
+#       guidance:
+#         - Summarize the archive outcome before finishing
