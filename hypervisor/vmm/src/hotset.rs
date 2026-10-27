@@ -24,9 +24,12 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use serde::Deserialize;
+
+use crate::pagemap_anon::host_page_size;
 
 /// Profile files live in the template snapshot state dir, next to the
 /// `memory-ranges` file cube-runtime writes: `<pkg>/metadata/snapshot/`.
@@ -37,6 +40,14 @@ const SUPPORTED_VERSION: u32 = 1;
 /// aggregate load.
 const MAX_TOTAL_RATIO_NUM: u64 = 1;
 const MAX_TOTAL_RATIO_DEN: u64 = 2;
+/// Runaway guard for the written extents: pre-COW turns every listed page
+/// into a private anonymous page on each clone, and the prewrite runs
+/// synchronously at restore time — a tighter bound than the prewarm's 1/2.
+/// This also rejects profiles collected without the soft-dirty baseline
+/// (every resident page reads as soft-dirty).
+const MAX_WRITTEN_RATIO_NUM: u64 = 1;
+const MAX_WRITTEN_RATIO_DEN: u64 = 8;
+const MAX_WRITTEN_EXTENTS: usize = 2048;
 /// Per-pread chunk: also the work unit handed to the workers, so a giant
 /// extent cannot serialize behind one thread.
 const PREAD_CHUNK_BYTES: usize = 1 << 20;
@@ -99,6 +110,10 @@ struct HotPagesProfile {
     /// [offset, len] byte ranges into the memory file.
     #[serde(default)]
     extents: Vec<[u64; 2]>,
+    /// [offset, len] byte ranges the profiled guest wrote between resume and
+    /// ready; the restore pre-COWs them before any vCPU runs.
+    #[serde(default)]
+    written_extents: Vec<[u64; 2]>,
 }
 
 fn validate(profile: &HotPagesProfile, actual_size: u64) -> Result<(), String> {
@@ -130,6 +145,40 @@ fn validate(profile: &HotPagesProfile, actual_size: u64) -> Result<(), String> {
     if total * MAX_TOTAL_RATIO_DEN > actual_size * MAX_TOTAL_RATIO_NUM {
         return Err(format!(
             "extent total {total} exceeds half of memory size {actual_size}"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate the written extents independently of the hotset: a failure drops
+/// only the prewrite, keeping the prewarm alive. An empty list is valid — it
+/// just means there is nothing to prewrite.
+fn validate_written(written: &[[u64; 2]], actual_size: u64) -> Result<(), String> {
+    if written.len() > MAX_WRITTEN_EXTENTS {
+        return Err(format!(
+            "written extent count {} over the {MAX_WRITTEN_EXTENTS} cap",
+            written.len()
+        ));
+    }
+    let mut total = 0u64;
+    for extent in written {
+        let [offset, len] = *extent;
+        if len == 0 {
+            return Err("zero-length written extent".to_string());
+        }
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| "written extent offset overflow".to_string())?;
+        if end > actual_size {
+            return Err(format!("written extent [{offset},{len}) out of bounds"));
+        }
+        total = total
+            .checked_add(len)
+            .ok_or_else(|| "written extent total overflow".to_string())?;
+    }
+    if total * MAX_WRITTEN_RATIO_DEN > actual_size * MAX_WRITTEN_RATIO_NUM {
+        return Err(format!(
+            "written extent total {total} exceeds 1/8 of memory size {actual_size}"
         ));
     }
     Ok(())
@@ -327,18 +376,28 @@ fn memory_target_size(file: &File, meta: &fs::Metadata) -> u64 {
     }
 }
 
-/// Kick page-cache prewarm for the guest memory hotset, if a valid profile
-/// exists in `snapshot_dir` (the snapshot state dir the restore reads VM state
-/// from). `memory_file` is the already-open memory file (volume) whose size
-/// the profile is validated against.
+/// What a restore should do with the template profile: the async page-cache
+/// prewarm guard, and — if the profile carries them — the known-written
+/// extents the caller must pre-COW before any vCPU runs.
+#[derive(Default)]
+pub struct RestoreHotsetPlan {
+    pub prewarm: Option<PrewarmGuard>,
+    pub written_extents: Option<Vec<[u64; 2]>>,
+}
+
+/// Read the template profile in `snapshot_dir` (the snapshot state dir the
+/// restore reads VM state from) and return what this restore should do with
+/// it. `memory_file` is the already-open memory file (volume) whose size the
+/// profile is validated against.
 ///
-/// Returns a guard cancelling the workers; the caller ties it to the restored
-/// VM's lifetime. Fire-and-forget otherwise: failures are logged at
-/// debug/warn and never propagated.
-pub fn restore_prewarm(memory_file: &File, snapshot_dir: &Path) -> Option<PrewarmGuard> {
+/// Fire-and-forget: every absence, corruption or validation failure
+/// downgrades — a hotset failure drops the whole plan, a written-extents
+/// failure keeps the prewarm and drops only the prewrite. Never propagated.
+pub fn restore_prepare(memory_file: &File, snapshot_dir: &Path) -> RestoreHotsetPlan {
+    let mut plan = RestoreHotsetPlan::default();
     if disabled() {
         debug!("restore memory hotset prewarm disabled");
-        return None;
+        return plan;
     }
     let profile_path = profile_path_for(snapshot_dir);
 
@@ -346,9 +405,10 @@ pub fn restore_prewarm(memory_file: &File, snapshot_dir: &Path) -> Option<Prewar
         Ok(m) => m,
         Err(e) => {
             debug!("restore memory hotset: memory file metadata failed: {e}");
-            return None;
+            return plan;
         }
     };
+    let actual_size = memory_target_size(&memory_file, &memory_meta);
 
     if let Err(e) = fs::metadata(&profile_path) {
         // Absent profile is the normal case (templates built with the
@@ -357,59 +417,192 @@ pub fn restore_prewarm(memory_file: &File, snapshot_dir: &Path) -> Option<Prewar
             "restore memory hotset: no profile at {}: {e}",
             profile_path.display()
         );
-        return None;
+        return plan;
     }
 
     let content = match fs::read_to_string(&profile_path) {
         Ok(c) => c,
         Err(e) => {
             debug!("restore memory hotset: profile unreadable: {e}");
-            return None;
+            return plan;
         }
     };
     let profile: HotPagesProfile = match serde_json::from_str(&content) {
         Ok(p) => p,
         Err(e) => {
             debug!("restore memory hotset: profile corrupt: {e}");
-            return None;
+            return plan;
         }
     };
 
-    if let Err(reason) = validate(&profile, memory_target_size(&memory_file, &memory_meta)) {
+    if let Err(reason) = validate(&profile, actual_size) {
         warn!(
             "restore memory hotset: profile rejected ({}): {reason}",
             profile_path.display()
         );
-        return None;
+        return plan;
     }
 
     if profile.extents.is_empty() {
-        debug!("restore memory hotset: empty profile, nothing to warm");
-        return None;
+        debug!("restore memory hotset: empty hotset, nothing to warm");
+    } else {
+        let total: u64 = profile.extents.iter().map(|e| e[1]).sum();
+        match memory_file.try_clone() {
+            Ok(worker_file) => match spawn_prewarm(worker_file, profile.extents.clone(), total) {
+                Ok((guard, _coordinator)) => {
+                    info!(
+                            "restore memory hotset prewarm kicked: {} extents, {} workers, {total} bytes",
+                            profile.extents.len(),
+                            worker_count()
+                        );
+                    plan.prewarm = Some(guard);
+                }
+                Err(e) => {
+                    debug!("restore memory hotset: cannot spawn prewarm workers: {e}");
+                }
+            },
+            Err(e) => {
+                debug!("restore memory hotset: cannot clone memory fd: {e}");
+            }
+        }
     }
 
-    let total: u64 = profile.extents.iter().map(|e| e[1]).sum();
-    let worker_file = match memory_file.try_clone() {
-        Ok(f) => f,
-        Err(e) => {
-            debug!("restore memory hotset: cannot clone memory fd: {e}");
-            return None;
+    if profile.written_extents.is_empty() {
+        debug!("restore memory hotset: profile carries no written extents");
+    } else if let Err(reason) = validate_written(&profile.written_extents, actual_size) {
+        warn!(
+            "restore memory hotset: written extents rejected ({}): {reason}",
+            profile_path.display()
+        );
+    } else {
+        plan.written_extents = Some(profile.written_extents.clone());
+    }
+
+    plan
+}
+
+/// MADV_POPULATE_WRITE needs Linux 5.14+; older kernels fail the first
+/// madvise with EINVAL. Cache the probe so an unsupported kernel costs one
+/// syscall per process, not per restore.
+static POPULATE_WRITE_OK: OnceLock<bool> = OnceLock::new();
+
+/// Intersect the written extents with one region's window
+/// [region_file_start, region_file_start + region_len), page-align the bounds
+/// outward and merge contiguous/overlapping pages. Returns
+/// (region-relative addr, len) madvise runs.
+fn page_runs_for_region(
+    extents: &[[u64; 2]],
+    region_file_start: u64,
+    region_len: u64,
+    page: u64,
+) -> Vec<(u64, u64)> {
+    let region_end = region_file_start.saturating_add(region_len);
+    // The region's page span in absolute file pages (exclusive last).
+    let first = region_file_start / page;
+    let last = first + region_len / page;
+    let mut spans: Vec<(u64, u64)> = Vec::new();
+    for &[offset, len] in extents {
+        if len == 0 {
+            continue;
         }
-    };
-    match spawn_prewarm(worker_file, profile.extents.clone(), total) {
-        Ok((guard, _coordinator)) => {
-            info!(
-                "restore memory hotset prewarm kicked: {} extents, {} workers, {total} bytes",
-                profile.extents.len(),
-                worker_count()
-            );
-            Some(guard)
+        let s = offset.max(region_file_start);
+        let e = offset.saturating_add(len).min(region_end);
+        if e <= s {
+            continue;
         }
-        Err(e) => {
-            debug!("restore memory hotset: cannot spawn prewarm workers: {e}");
-            None
+        let start_page = (s / page).max(first);
+        let end_page = ((e + page - 1) / page).min(last);
+        if end_page > start_page {
+            spans.push((start_page - first, end_page - first));
         }
     }
+    spans.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (s, e) in spans {
+        match merged.last_mut() {
+            Some((_, last_end)) if s <= *last_end => {
+                if e > *last_end {
+                    *last_end = e;
+                }
+            }
+            _ => merged.push((s, e)),
+        }
+    }
+    merged
+        .into_iter()
+        .map(|(s, e)| (s * page, (e - s) * page))
+        .collect()
+}
+
+/// Pre-COW the written extents inside one freshly restored region, before
+/// any vCPU runs: populating for write on a not-yet-faulted MAP_PRIVATE page
+/// takes do_cow_fault and needs no TLB invalidation on the vCPU path. Best
+/// effort — madvise failures are counted and logged, never fatal.
+///
+/// # Safety
+/// `region_ptr` must be the base of a live MAP_PRIVATE mapping of the memory
+/// file at `region_file_start`, not yet shared with any vCPU; madvise only
+/// installs PTEs within [ptr, ptr+region_len).
+pub fn prewrite_written_region(
+    region_ptr: *mut u8,
+    region_len: u64,
+    region_file_start: u64,
+    extents: &[[u64; 2]],
+) {
+    if extents.is_empty() {
+        return;
+    }
+    if matches!(POPULATE_WRITE_OK.get(), Some(false)) {
+        return;
+    }
+    let page = host_page_size();
+    if region_file_start % page != 0 {
+        warn!("restore memory hotset prewrite: unaligned snapshot offset 0x{region_file_start:x}");
+        return;
+    }
+    let runs = page_runs_for_region(extents, region_file_start, region_len, page);
+    if runs.is_empty() {
+        debug!(
+            "restore memory hotset prewrite: no written pages in region at 0x{region_file_start:x}"
+        );
+        return;
+    }
+
+    let started = Instant::now();
+    let (mut pages, mut failed) = (0u64, 0u64);
+    for &(addr, len) in &runs {
+        pages += len / page;
+        // SAFETY: the run lies within the live mapping per the function contract.
+        let ret = unsafe {
+            libc::madvise(
+                region_ptr.add(addr as usize).cast(),
+                len as usize,
+                libc::MADV_POPULATE_WRITE,
+            )
+        };
+        if ret != 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINVAL) {
+                // Kernel without MADV_POPULATE_WRITE (< 5.14).
+                if POPULATE_WRITE_OK.set(false).is_ok() {
+                    warn!(
+                        "restore memory hotset prewrite: kernel lacks MADV_POPULATE_WRITE, skipping ({err})"
+                    );
+                }
+                return;
+            }
+            debug!("restore memory hotset prewrite: madvise at 0x{addr:x} failed: {err}");
+            failed += 1;
+        }
+    }
+    // `set` fails only when another thread settled the probe first; either
+    // way madvise worked, which is all future restores need to know.
+    let _ = POPULATE_WRITE_OK.set(true);
+    info!(
+        "restore memory hotset prewrite: {pages} pages in {} ranges ({failed} failed) in {:?}",
+        runs.len(),
+        started.elapsed()
+    );
 }
 
 #[cfg(test)]
@@ -428,6 +621,7 @@ mod tests {
             mem_file_size,
             profiled_at: "2026-09-20T03:00:00Z".to_string(),
             extents: extents.to_vec(),
+            written_extents: Vec::new(),
         }
     }
 
@@ -476,6 +670,34 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_written_matrix() {
+        let _g = LOCK.lock().unwrap();
+        let size = 1 << 20;
+        // an empty written set is valid: nothing to prewrite
+        assert_eq!(validate_written(&[], size), Ok(()));
+        // in-bounds extents pass
+        assert_eq!(
+            validate_written(&[[0, 4096], [size - 4096, 4096]], size),
+            Ok(())
+        );
+        // zero length
+        assert!(validate_written(&[[0, 0]], size).is_err());
+        // out of bounds
+        assert!(validate_written(&[[size - 100, 4096]], size).is_err());
+        // over the 1/8 total
+        assert!(validate_written(&[[0, size / 8 + 1]], size).is_err());
+        // exactly 1/8 passes
+        assert_eq!(validate_written(&[[0, size / 8]], size), Ok(()));
+        // over the extent-count cap
+        let many = vec![[0u64, 4096]; MAX_WRITTEN_EXTENTS + 1];
+        assert!(validate_written(&many, 1 << 30).is_err());
+        assert_eq!(
+            validate_written(&many[..MAX_WRITTEN_EXTENTS], 1 << 30),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn test_memory_target_size_regular_file_is_st_size() {
         let _g = LOCK.lock().unwrap();
         let dir = temp_dir_case("size");
@@ -511,24 +733,199 @@ mod tests {
     }
 
     #[test]
-    fn test_restore_prewarm_missing_profile_is_noop() {
+    fn test_restore_prepare_missing_profile_is_noop() {
         let _g = LOCK.lock().unwrap();
         let dir = temp_dir_case("missing");
         let mem = write_file(&dir.join("mem.bin"), &vec![0u8; 8192]);
         // no profile file: must not panic, must not log errors
-        restore_prewarm(&mem, &dir);
+        let plan = restore_prepare(&mem, &dir);
+        assert!(plan.prewarm.is_none());
+        assert!(plan.written_extents.is_none());
         fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn test_restore_prewarm_valid_profile_kicks() {
+    fn test_restore_prepare_returns_prewarm_and_written() {
+        let _g = LOCK.lock().unwrap();
+        let dir = temp_dir_case("prepare");
+        let mem_path = dir.join("mem.bin");
+        let mem = write_file(&mem_path, &vec![0xABu8; 1 << 20]);
+        fs::write(
+            profile_path_for(&dir),
+            r#"{"version":1,"mem_file_size":1048576,"extents":[[0,4096]],"written_extents":[[8192,4096]]}"#,
+        )
+        .unwrap();
+        let plan = restore_prepare(&mem, &dir);
+        assert!(plan.prewarm.is_some());
+        assert_eq!(plan.written_extents, Some(vec![[8192, 4096]]));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_restore_prepare_without_written_extents() {
+        let _g = LOCK.lock().unwrap();
+        let dir = temp_dir_case("prepare-nowritten");
+        let mem_path = dir.join("mem.bin");
+        let mem = write_file(&mem_path, &vec![0xABu8; 1 << 20]);
+        // profiles without the field deserialize via serde default
+        fs::write(
+            profile_path_for(&dir),
+            r#"{"version":1,"mem_file_size":1048576,"extents":[[0,4096]]}"#,
+        )
+        .unwrap();
+        let plan = restore_prepare(&mem, &dir);
+        assert!(plan.prewarm.is_some());
+        assert!(plan.written_extents.is_none());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_restore_prepare_written_cap_keeps_prewarm() {
+        let _g = LOCK.lock().unwrap();
+        let dir = temp_dir_case("prepare-cap");
+        let mem_path = dir.join("mem.bin");
+        let mem = write_file(&mem_path, &vec![0xABu8; 1 << 20]);
+        // written total 256KiB+1 exceeds 1/8 of 1MiB; the hotset is fine
+        fs::write(
+            profile_path_for(&dir),
+            r#"{"version":1,"mem_file_size":1048576,"extents":[[0,4096]],"written_extents":[[0,262145]]}"#,
+        )
+        .unwrap();
+        let plan = restore_prepare(&mem, &dir);
+        assert!(plan.prewarm.is_some());
+        assert!(plan.written_extents.is_none());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_restore_prepare_valid_profile_kicks() {
         let _g = LOCK.lock().unwrap();
         let dir = temp_dir_case("valid");
         let mem_path = dir.join("mem.bin");
         let mem = write_file(&mem_path, &vec![0xABu8; 1 << 20]);
         let profile_path = profile_path_for(&dir);
         fs::write(&profile_path, r#"{"version":1,"template_id":"t","mem_file_size":1048576,"profiled_at":"x","extents":[[0,4096],[8192,4096]]}"#).unwrap();
-        restore_prewarm(&mem, &dir);
+        let plan = restore_prepare(&mem, &dir);
+        assert!(plan.prewarm.is_some());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_page_runs_for_region() {
+        const PAGE: u64 = 4096;
+        // extent fully inside the region
+        let runs = page_runs_for_region(&[[PAGE, 3 * PAGE]], 0, 16 * PAGE, PAGE);
+        assert_eq!(runs, vec![(PAGE, 3 * PAGE)]);
+
+        // unaligned extent bounds are rounded outward onto pages
+        let runs = page_runs_for_region(&[[PAGE + 100, 2 * PAGE]], 0, 16 * PAGE, PAGE);
+        assert_eq!(runs, vec![(PAGE, 3 * PAGE)]);
+
+        // separated extents stay split; adjacent ones merge
+        let runs = page_runs_for_region(
+            &[
+                [0, PAGE],
+                [2 * PAGE, PAGE],
+                [4 * PAGE, PAGE],
+                [5 * PAGE, PAGE],
+            ],
+            0,
+            16 * PAGE,
+            PAGE,
+        );
+        assert_eq!(
+            runs,
+            vec![(0, PAGE), (2 * PAGE, PAGE), (4 * PAGE, 2 * PAGE)]
+        );
+
+        // extents outside the region window drop; straddling ones clamp
+        let runs = page_runs_for_region(
+            &[[0, PAGE], [20 * PAGE, PAGE], [15 * PAGE, 4 * PAGE]],
+            8 * PAGE,
+            8 * PAGE, // region covers file pages 8..16
+            PAGE,
+        );
+        assert_eq!(runs, vec![(7 * PAGE, PAGE)]); // file page 15 -> region page 7
+
+        // nothing intersects
+        assert!(page_runs_for_region(&[[0, PAGE]], 8 * PAGE, 8 * PAGE, PAGE).is_empty());
+    }
+
+    #[test]
+    fn test_prewrite_populates_region() {
+        let _g = LOCK.lock().unwrap();
+        if matches!(POPULATE_WRITE_OK.get(), Some(false)) {
+            // kernel without MADV_POPULATE_WRITE (< 5.14): nothing to verify
+            return;
+        }
+        const LEN: u64 = 1 << 20;
+        let dir = temp_dir_case("prewrite");
+        let mem_path = dir.join("mem.bin");
+        fs::write(&mem_path, &vec![0u8; LEN as usize]).unwrap();
+        let file = File::open(&mem_path).unwrap();
+
+        // MAP_PRIVATE over the memory file, like a fast-restore region.
+        // SAFETY: test-only mapping, torn down with munmap below.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                LEN as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_NORESERVE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(ptr, libc::MAP_FAILED);
+        let ptr = ptr as *mut u8;
+
+        // present (bit 63) and file/shared-anon (bit 61) bits of the pagemap
+        // entry for one host page of the test mapping; PFN bits may be masked
+        // for unprivileged readers, the classification bits are not.
+        let pagemap_bits = |addr: u64| -> u64 {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut f = File::open("/proc/self/pagemap").unwrap();
+            f.seek(SeekFrom::Start(addr / host_page_size() * 8))
+                .unwrap();
+            let mut buf = [0u8; 8];
+            f.read_exact(&mut buf).unwrap();
+            u64::from_le_bytes(buf)
+        };
+
+        // nothing faulted in yet on a fresh MAP_PRIVATE mapping
+        assert_eq!(
+            pagemap_bits(ptr as u64) & (1 << 63),
+            0,
+            "fresh mapping must have no PTEs"
+        );
+
+        prewrite_written_region(ptr, LEN, 0, &[[0x10000, 0x3000]]);
+
+        // the written range is present and private anonymous (COWed away
+        // from the shared file page)
+        for off in [0x10000u64, 0x11000, 0x12000] {
+            let entry = pagemap_bits(ptr as u64 + off);
+            assert_ne!(entry & (1 << 63), 0, "page at +{off:#x} must be present");
+            assert_eq!(
+                entry & (1 << 61),
+                0,
+                "page at +{off:#x} must be a private anonymous copy"
+            );
+        }
+        // pages outside the written extents stay unpopulated
+        assert_eq!(
+            pagemap_bits(ptr as u64) & (1 << 63),
+            0,
+            "untouched pages must stay unpopulated"
+        );
+        assert_eq!(
+            pagemap_bits(ptr as u64 + 0x13000) & (1 << 63),
+            0,
+            "untouched pages must stay unpopulated"
+        );
+
+        // SAFETY: unmapping the test-only mapping.
+        unsafe { libc::munmap(ptr.cast(), LEN as usize) };
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -578,30 +975,28 @@ mod tests {
         // 64 MiB, 64 chunks: far more than a worker can finish before the
         // cancel lands on the next scheduling quantum
         let mem = write_file(&dir.join("mem.bin"), &vec![0u8; 64 << 20]);
-        let (guard, coordinator) = spawn_prewarm(
-            mem.try_clone().unwrap(),
-            vec![[0, 64 << 20]],
-            64 << 20,
-        )
-        .unwrap();
+        let (guard, coordinator) =
+            spawn_prewarm(mem.try_clone().unwrap(), vec![[0, 64 << 20]], 64 << 20).unwrap();
         guard.cancel();
         coordinator.join().unwrap();
         fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn test_restore_prewarm_corrupt_is_noop() {
+    fn test_restore_prepare_corrupt_is_noop() {
         let _g = LOCK.lock().unwrap();
         let dir = temp_dir_case("corrupt");
         let mem_path = dir.join("mem.bin");
         let mem = write_file(&mem_path, &vec![0u8; 8192]);
         fs::write(profile_path_for(&dir), "{not json").unwrap();
-        restore_prewarm(&mem, &dir);
+        let plan = restore_prepare(&mem, &dir);
+        assert!(plan.prewarm.is_none());
+        assert!(plan.written_extents.is_none());
         fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn test_restore_prewarm_disabled_by_env() {
+    fn test_restore_prepare_disabled_by_env() {
         let _g = LOCK.lock().unwrap();
         std::env::set_var("CUBE_VMM_RESTORE_HOTSET_DISABLE", "1");
         let dir = temp_dir_case("disabled");
@@ -613,7 +1008,9 @@ mod tests {
         )
         .unwrap();
         // must return early without reading/validating anything
-        restore_prewarm(&mem, &dir);
+        let plan = restore_prepare(&mem, &dir);
+        assert!(plan.prewarm.is_none());
+        assert!(plan.written_extents.is_none());
         std::env::remove_var("CUBE_VMM_RESTORE_HOTSET_DISABLE");
         fs::remove_dir_all(&dir).ok();
     }

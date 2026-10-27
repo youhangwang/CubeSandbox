@@ -37,6 +37,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom};
 use std::ops::Deref;
 use std::os::fd::AsFd;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::result;
@@ -1342,20 +1343,22 @@ impl MemoryManager {
                     .map_err(Error::Restore)?;
 
             let fast_restore = Self::support_fast_restore_check(config);
-            // Hotset prewarm guard, if a valid profile exists: kick the
-            // workers before the VM is assembled and tie them to its
-            // lifetime. Never fatal.
-            let mut prewarm: Option<crate::hotset::PrewarmGuard> = None;
+            // Hotset plan, if a valid profile exists: kick the page-cache
+            // prewarm workers before the VM is assembled and carry the
+            // known-written extents for the pre-COW below. Never fatal.
+            let mut plan = crate::hotset::RestoreHotsetPlan::default();
+            let mut mem_ident: Option<(u64, u64)> = None;
             let memory_file = if fast_restore {
                 info!("restore non-shared map, speed up restore by share map memory file");
                 let file = memory_file_target
                     .open_read()
                     .map_err(Error::SnapshotOpen)?;
-                prewarm = match url_to_path(source_url) {
-                    Ok(snapshot_dir) => crate::hotset::restore_prewarm(&file, &snapshot_dir),
+                mem_ident = Self::file_ident(&file);
+                plan = match url_to_path(source_url) {
+                    Ok(snapshot_dir) => crate::hotset::restore_prepare(&file, &snapshot_dir),
                     Err(e) => {
                         debug!("restore memory hotset: bad snapshot url: {e}");
-                        None
+                        crate::hotset::RestoreHotsetPlan::default()
                     }
                 };
                 Some(file)
@@ -1383,19 +1386,37 @@ impl MemoryManager {
 
             let mm = match result {
                 Ok(mm) => {
-                    if let Some(guard) = prewarm.take() {
+                    if let Some(guard) = plan.prewarm.take() {
                         mm.lock().unwrap().prewarm = Some(guard);
                     }
                     mm
                 }
                 // No VM will own the workers; stop them now.
                 Err(e) => {
-                    if let Some(guard) = prewarm.take() {
+                    if let Some(guard) = plan.prewarm.take() {
                         guard.cancel();
                     }
                     return Err(e);
                 }
             };
+
+            // With the regions in place but before any vCPU runs: pre-COW
+            // the snapshot pages the guest is known to write (a later write
+            // then costs no stage-2 fault / TLB invalidation on the vCPU
+            // path), and arm the soft-dirty baseline so the template profile
+            // collector can read the guest's write set from pagemap after
+            // ready. 
+            if fast_restore && !prefault {
+                if let Some(written) = plan.written_extents.take() {
+                    Self::prewrite_written_extents(&mm, mem_ident, &written);
+                }
+                // Best effort: kernels without CONFIG_MEM_SOFT_DIRTY no-op.
+                if let Err(e) = clear_soft_dirty() {
+                    debug!("restore: arm soft-dirty baseline failed: {e}");
+                } else {
+                    debug!("restore: soft-dirty baseline armed");
+                }
+            }
 
             if !fast_restore {
                 info!("restore shared map, fall back to slow restore");
@@ -1412,6 +1433,53 @@ impl MemoryManager {
 
     fn support_fast_restore_check(config: &MemoryConfig) -> bool {
         !config.exist_shared() && !config.has_hotplug_virtio_mem()
+    }
+
+    /// (st_dev, st_ino) of an open file, used to recognize the memory
+    /// volume's regions among all restored RAM regions: backing-file and
+    /// existing-memory regions carry a file offset too.
+    fn file_ident(file: &File) -> Option<(u64, u64)> {
+        file.metadata().ok().map(|m| (m.dev(), m.ino()))
+    }
+
+    /// Pre-COW the written extents inside the restored RAM regions backed by
+    /// the memory volume (matched by file identity), before any vCPU runs.
+    /// Synchronous by design and bounded by the profile's written-extent
+    /// caps; failures inside the hotset helper are logged, never fatal.
+    fn prewrite_written_extents(
+        mm: &Arc<Mutex<MemoryManager>>,
+        mem_ident: Option<(u64, u64)>,
+        extents: &[[u64; 2]],
+    ) {
+        let mem_ident = match mem_ident {
+            Some(ident) => ident,
+            None => return,
+        };
+        let regions: Vec<Arc<GuestRegionMmap>> = {
+            let mm = mm.lock().unwrap();
+            mm.memory_zones()
+                .values()
+                .flat_map(|zone| zone.regions().iter().cloned())
+                .collect()
+        };
+        for region in regions {
+            let (file, file_start) = match region.file_offset() {
+                Some(fo) => (fo.file(), fo.start()),
+                // Anonymous region: no snapshot backing, nothing to pre-COW.
+                None => continue,
+            };
+            if Self::file_ident(file) != Some(mem_ident) {
+                // Backing-file / existing-memory region of a non-fast-restore
+                // mapping: the profile's offsets do not apply.
+                continue;
+            }
+            crate::hotset::prewrite_written_region(
+                region.as_ptr(),
+                region.len(),
+                file_start,
+                extents,
+            );
+        }
     }
 
     fn memfd_create(name: &ffi::CStr, flags: u32) -> Result<RawFd, io::Error> {
