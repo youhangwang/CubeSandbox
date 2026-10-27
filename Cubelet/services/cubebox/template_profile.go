@@ -17,6 +17,19 @@ package cubebox
 // metadata, where the VMM consumes it at fast-restore time to prewarm the
 // page cache (hypervisor/vmm/src/hotset.rs).
 //
+// The same pagemap read also collects the pages the guest wrote between
+// resume and ready: the VMM arms soft-dirty tracking right after it maps
+// the snapshot (before any vCPU runs), so bit 55 marks exactly the pages
+// written since. Present private-anonymous pages carrying the bit (plus
+// swapped ones) are unioned across the rounds into written_extents, which
+// the VMM uses at fast-restore time to pre-COW (MADV_POPULATE_WRITE) the
+// pages the restored guest is known to write, sparing the vCPU-path
+// stage-2 fault and TLB invalidation of a read-then-write COW. On kernels
+// without CONFIG_MEM_SOFT_DIRTY bit 55 is never set; the written set then
+// falls back to the private-anonymous pages alone (bit 61 clear): the
+// snapshot is mapped MAP_PRIVATE by a VMM process started for the restore,
+// so such a page is a copy COWed since the mapping was created.
+//
 // The phase is strictly optional and fail-open: any error — including the
 // overall budget running out — is returned to the caller, which logs a
 // warning and publishes the template without a profile.
@@ -69,6 +82,13 @@ const (
 	// this point the profile costs more than it saves, and the phase fails
 	// open: the template publishes without a profile.
 	hotPagesMaxExtents = 4096
+	// writtenPagesMaxTotalDen caps the written extents at 1/N of the memory
+	// volume: pre-COW turns every listed page into a private anonymous page
+	// on each clone, and the prewrite runs synchronously at restore time.
+	writtenPagesMaxTotalDen = 8
+	// writtenPagesMaxExtents caps how many written extents a profile may
+	// carry; a violation drops only the written set and keeps the hotset.
+	writtenPagesMaxExtents = 2048
 	// extentCoalescePages merges hot pages separated by small gaps so the
 	// extent list stays short.
 	extentCoalescePages = 16
@@ -107,20 +127,26 @@ func (s *service) runTemplateProfilePhase(
 	memFileSize uint64,
 ) error {
 	deadline := time.Now().Add(templateProfileBudget())
-	roundSets := make([]map[uint64]struct{}, 0, verifyRounds)
+	roundSets := make([]roundPageSets, 0, verifyRounds)
 	for round := 0; round < verifyRounds; round++ {
 		remaining := time.Until(deadline)
 		if remaining <= minRoundBudget {
 			return fmt.Errorf("budget exhausted after %d/%d rounds", round, verifyRounds)
 		}
-		set, err := s.profileVerificationRound(ctx, stepLog, createReq, backend, templateID, round, remaining)
+		sets, err := s.profileVerificationRound(ctx, stepLog, createReq, backend, templateID, round, remaining)
 		if err != nil {
 			return fmt.Errorf("verification round %d: %w", round, err)
 		}
-		roundSets = append(roundSets, set)
+		roundSets = append(roundSets, sets)
 	}
 
-	pages := intersectPageSets(roundSets)
+	presents := make([]map[uint64]struct{}, 0, len(roundSets))
+	writtens := make([]map[uint64]struct{}, 0, len(roundSets))
+	for _, rs := range roundSets {
+		presents = append(presents, rs.present)
+		writtens = append(writtens, rs.written)
+	}
+	pages := intersectPageSets(presents)
 	if len(pages) == 0 {
 		return errors.New("empty page intersection across rounds")
 	}
@@ -128,20 +154,43 @@ func (s *service) runTemplateProfilePhase(
 	if err := checkHotProfileCaps(extents, totalBytes, memFileSize); err != nil {
 		return err
 	}
-	if err := writeHotPagesFile(profilePath, templateID, memFileSize, extents); err != nil {
+	// The written set is advisory on top of the hotset: an empty one is
+	// normal (VMM without the soft-dirty baseline, guest wrote nothing
+	// before ready) and a cap violation drops only the written
+	// extents, keeping the profile usable for prewarm.
+	writtenPages := unionPageSets(writtens)
+	writtenExtents, writtenBytes := mergeHotExtents(writtenPages, extentCoalescePages, memFileSize)
+	if err := checkWrittenProfileCaps(writtenExtents, writtenBytes, memFileSize); err != nil {
+		stepLog.Warnf("template profile: written extents dropped: %v", err)
+		writtenExtents, writtenBytes = [][2]uint64{}, 0
+	}
+	if err := writeHotPagesFile(profilePath, templateID, memFileSize, extents, writtenExtents); err != nil {
 		return fmt.Errorf("write profile: %w", err)
 	}
-	stepLog.Infof("template profile: wrote %s: %d extents, %d pages, %d bytes (%.1f%% of memory)",
+	stepLog.Infof("template profile: wrote %s: %d extents, %d pages, %d bytes (%.1f%% of memory); written: %d extents, %d bytes (%.1f%%)",
 		profilePath, len(extents), len(pages), totalBytes,
-		float64(totalBytes)/float64(memFileSize)*100)
+		float64(totalBytes)/float64(memFileSize)*100,
+		len(writtenExtents), writtenBytes,
+		float64(writtenBytes)/float64(memFileSize)*100)
 	return nil
+}
+
+// roundPageSets is one verification round's page sets: present pages
+// (hotset candidates) and pages the guest wrote since the VMM armed
+// soft-dirty tracking at restore time (pre-COW candidates). softDirty
+// reports whether any page carried bit 55; when none did, written holds
+// the bit-61 fallback (all private anonymous pages).
+type roundPageSets struct {
+	present   map[uint64]struct{}
+	written   map[uint64]struct{}
+	softDirty bool
 }
 
 // profileVerificationRound starts one verification sandbox from the new
 // template through the normal create path, waits for it to become ready
-// (Create returns), collects the touched page set from the VMM process and
-// destroys the sandbox best-effort on every path: Create is not atomic, and
-// a failed create can still leave the sandbox behind.
+// (Create returns), collects the touched and written page sets from the VMM
+// process and destroys the sandbox best-effort on every path: Create is not
+// atomic, and a failed create can still leave the sandbox behind.
 func (s *service) profileVerificationRound(
 	ctx context.Context,
 	stepLog *log.CubeWrapperLogEntry,
@@ -149,10 +198,10 @@ func (s *service) profileVerificationRound(
 	backend, templateID string,
 	round int,
 	budget time.Duration,
-) (map[uint64]struct{}, error) {
+) (roundPageSets, error) {
 	verifyReq, err := buildProfileVerifyRequest(createReq, templateID, round)
 	if err != nil {
-		return nil, err
+		return roundPageSets{}, err
 	}
 
 	// Derived from the incoming ctx, so an aborted build also aborts the
@@ -204,19 +253,19 @@ func (s *service) profileVerificationRound(
 	if createErr != nil || !ret.IsSuccessCode(createRsp.GetRet().GetRetCode()) {
 		destroyRoundSandbox()
 		if createErr != nil {
-			return nil, fmt.Errorf("create verification sandbox: %w", createErr)
+			return roundPageSets{}, fmt.Errorf("create verification sandbox: %w", createErr)
 		}
-		return nil, fmt.Errorf("create verification sandbox: %s", createRsp.GetRet().GetRetMsg())
+		return roundPageSets{}, fmt.Errorf("create verification sandbox: %s", createRsp.GetRet().GetRetMsg())
 	}
 	roundLog.Infof("verification sandbox created: %s", sandboxID)
 
 	// Always destroy the verification sandbox, even when collection failed.
-	pages, collectErr := s.collectVerificationPageset(verifyCtx, roundLog, backend, templateID, sandboxID)
+	sets, collectErr := s.collectVerificationPageset(verifyCtx, roundLog, backend, templateID, sandboxID)
 	destroyRoundSandbox()
 	if collectErr != nil {
-		return nil, collectErr
+		return roundPageSets{}, collectErr
 	}
-	return pages, nil
+	return sets, nil
 }
 
 // buildProfileVerifyRequest derives a template-restore create request from
@@ -244,43 +293,48 @@ func buildProfileVerifyRequest(createReq *cubebox.RunCubeSandboxRequest, templat
 }
 
 // collectVerificationPageset resolves the template memory volume, locates
-// the VMM process of sandboxID holding it mapped, and reads the present
-// pages out of its pagemap.
+// the VMM process of sandboxID holding it mapped, and reads the present and
+// soft-dirty written page sets out of its pagemap.
 func (s *service) collectVerificationPageset(
 	ctx context.Context,
 	stepLog *log.CubeWrapperLogEntry,
 	backend, templateID, sandboxID string,
-) (map[uint64]struct{}, error) {
+) (roundPageSets, error) {
 	entry, err := storage.GetLocalSnapshotFor(ctx, backend, templateID)
 	if err != nil || entry == nil {
-		return nil, fmt.Errorf("resolve template catalog: %w", err)
+		return roundPageSets{}, fmt.Errorf("resolve template catalog: %w", err)
 	}
 	if strings.TrimSpace(entry.MemoryVol) == "" {
-		return nil, errors.New("template catalog has no memory volume")
+		return roundPageSets{}, errors.New("template catalog has no memory volume")
 	}
 	memoryDevPath, err := storage.ResolveObjectPathFor(ctx, backend, entry.MemoryVol, entry.MemoryKind)
 	if err != nil {
-		return nil, fmt.Errorf("resolve memory volume %s: %w", entry.MemoryVol, err)
+		return roundPageSets{}, fmt.Errorf("resolve memory volume %s: %w", entry.MemoryVol, err)
 	}
 
 	cb, err := s.cubeboxMgr.cubeboxManger.Get(ctx, sandboxID)
 	if err != nil {
-		return nil, fmt.Errorf("load sandbox record: %w", err)
+		return roundPageSets{}, fmt.Errorf("load sandbox record: %w", err)
 	}
 	// Bundle pids (shim.pid / vmm.pid) are included so the lookup also works
 	// if the VMM runs out of process; the embedded VMM records the same pid
 	// as the endpoint.
 	pid := findVMMProcessPid(s.cubeboxMgr.collectSandboxRuntimePIDs(ctx, cb), memoryDevPath)
 	if pid <= 0 {
-		return nil, fmt.Errorf("no process maps %s for sandbox %s", memoryDevPath, sandboxID)
+		return roundPageSets{}, fmt.Errorf("no process maps %s for sandbox %s", memoryDevPath, sandboxID)
 	}
 
-	pages, err := collectPresentPageset(ctx, pid, memoryDevPath)
+	sets, err := collectPageset(ctx, pid, memoryDevPath)
 	if err != nil {
-		return nil, fmt.Errorf("collect pagemap of pid %d: %w", pid, err)
+		return roundPageSets{}, fmt.Errorf("collect pagemap of pid %d: %w", pid, err)
 	}
-	stepLog.Infof("collected %d present pages from pid %d (%s)", len(pages), pid, memoryDevPath)
-	return pages, nil
+	writtenRule := "soft-dirty"
+	if !sets.softDirty {
+		writtenRule = "private-anon fallback, no soft-dirty"
+	}
+	stepLog.Infof("collected %d present / %d written (%s) pages from pid %d (%s)",
+		len(sets.present), len(sets.written), writtenRule, pid, memoryDevPath)
+	return sets, nil
 }
 
 // mapsDevT is the identity of the memory volume in the terms
@@ -441,31 +495,51 @@ func parseMapsLine(line, memoryDevPath string, ident mapsDevT, identKnown bool) 
 	return procMapLine{startAddr: start, endAddr: end, fileOffset: offset}, true
 }
 
-// collectPresentPageset reads /proc/<pid>/maps + pagemap and returns the set
-// of present page numbers (in memory-file page units) among the process's
-// mappings of memoryDevPath.
-func collectPresentPageset(ctx context.Context, pid int, memoryDevPath string) (map[uint64]struct{}, error) {
+// collectPageset reads /proc/<pid>/maps + pagemap and returns the present
+// pages (hotset candidates) and the written pages (pre-COW candidates), as
+// page numbers in memory-file page units, among the process's mappings of
+// memoryDevPath.
+func collectPageset(ctx context.Context, pid int, memoryDevPath string) (roundPageSets, error) {
 	mapsData, err := os.ReadFile(fmt.Sprintf("/proc/%d/maps", pid))
 	if err != nil {
-		return nil, fmt.Errorf("read maps: %w", err)
+		return roundPageSets{}, fmt.Errorf("read maps: %w", err)
 	}
 	pagemap, err := os.Open(fmt.Sprintf("/proc/%d/pagemap", pid)) // NOCC:Path Traversal()
 	if err != nil {
-		return nil, fmt.Errorf("open pagemap: %w", err)
+		return roundPageSets{}, fmt.Errorf("open pagemap: %w", err)
 	}
 	defer pagemap.Close()
-	return parsePresentPageset(ctx, string(mapsData), pagemap, memoryDevPath, uint64(os.Getpagesize()))
+	return parsePageset(ctx, string(mapsData), pagemap, memoryDevPath, uint64(os.Getpagesize()))
 }
 
-// parsePresentPageset walks the maps entries matching memoryDevPath and reads
-// the pagemap present bits for their vaddr ranges. Split from
-// collectPresentPageset for fixture-driven unit tests.
-func parsePresentPageset(ctx context.Context, mapsData string, pagemap io.ReadSeeker, memoryDevPath string, pageSize uint64) (map[uint64]struct{}, error) {
+// /proc/<pid>/pagemap entry bits (fs/proc/task_mmu.c): 63 present,
+// 62 swapped, 61 file-page-or-shared-anon, 55 soft-dirty.
+const (
+	pagemapPresentBit   = 1 << 63
+	pagemapSwappedBit   = 1 << 62
+	pagemapFileAnonBit  = 1 << 61
+	pagemapSoftDirtyBit = 1 << 55
+)
+
+// parsePageset walks the maps entries matching memoryDevPath and reads the
+// pagemap bits for their vaddr ranges in one pass. Present pages go to the
+// hotset candidate set; pages marked soft-dirty since the VMM armed tracking
+// at restore time go to the written set when they are private anonymous
+// (bit 61 clear — a COWed copy), plus swapped ones. If no page carries
+// soft-dirty (kernel without CONFIG_MEM_SOFT_DIRTY), the written set is
+// every private anonymous page plus swapped ones. Split from collectPageset
+// for fixture-driven unit tests.
+func parsePageset(ctx context.Context, mapsData string, pagemap io.ReadSeeker, memoryDevPath string, pageSize uint64) (roundPageSets, error) {
 	ident, identKnown := resolveMapsDev(memoryDevPath)
-	pages := map[uint64]struct{}{}
+	present := map[uint64]struct{}{}
+	written := map[uint64]struct{}{}
+	// privateWritten ignores bit 55; it is the written set when no page
+	// carries soft-dirty.
+	privateWritten := map[uint64]struct{}{}
+	softDirty := false
 	for _, line := range strings.Split(mapsData, "\n") {
 		if err := ctx.Err(); err != nil {
-			return nil, fmt.Errorf("pagemap collection cancelled: %w", err)
+			return roundPageSets{}, fmt.Errorf("pagemap collection cancelled: %w", err)
 		}
 		m, ok := parseMapsLine(line, memoryDevPath, ident, identKnown)
 		if !ok {
@@ -479,23 +553,46 @@ func parsePresentPageset(ctx context.Context, mapsData string, pagemap io.ReadSe
 		count := endPage - startPage
 		raw := make([]byte, count*8)
 		if _, err := pagemap.Seek(int64(startPage*8), 0); err != nil {
-			return nil, fmt.Errorf("seek pagemap: %w", err)
+			return roundPageSets{}, fmt.Errorf("seek pagemap: %w", err)
 		}
 		if _, err := io.ReadFull(pagemap, raw); err != nil {
-			return nil, fmt.Errorf("read pagemap: %w", err)
+			return roundPageSets{}, fmt.Errorf("read pagemap: %w", err)
 		}
 		for i := 0; i < len(raw); i += 8 {
-			// Bit 63: page present. Swapped-out pages are not resident and
-			// must not enter the hotset.
-			if binary.LittleEndian.Uint64(raw[i:])&(1<<63) == 0 {
+			entry := binary.LittleEndian.Uint64(raw[i:])
+			if entry&(pagemapPresentBit|pagemapSwappedBit) == 0 {
 				continue
 			}
 			// VMM mappings are page-aligned: mapping page i covers memory
 			// file offset fileOffset + (i/8)*pageSize.
-			pages[m.fileOffset/pageSize+uint64(i/8)] = struct{}{}
+			page := m.fileOffset/pageSize + uint64(i/8)
+			// Bit 63: page present. Swapped-out pages are not resident and
+			// must not enter the hotset.
+			if entry&pagemapPresentBit != 0 {
+				present[page] = struct{}{}
+				if entry&pagemapSoftDirtyBit != 0 {
+					softDirty = true
+				}
+			}
+			// Written: soft-dirty since the VMM armed tracking at restore,
+			// restricted to private anonymous pages (bit 61 clear) so read
+			// faults and fault-around on the shared file mapping cannot leak
+			// into the written set; a swapped-out page was written before it
+			// was swapped out.
+			private := entry&pagemapPresentBit != 0 && entry&pagemapFileAnonBit == 0
+			swapped := entry&pagemapSwappedBit != 0
+			if (private && entry&pagemapSoftDirtyBit != 0) || swapped {
+				written[page] = struct{}{}
+			}
+			if private || swapped {
+				privateWritten[page] = struct{}{}
+			}
 		}
 	}
-	return pages, nil
+	if !softDirty {
+		written = privateWritten
+	}
+	return roundPageSets{present: present, written: written, softDirty: softDirty}, nil
 }
 
 // intersectPageSets keeps only pages present in every round.
@@ -509,6 +606,23 @@ func intersectPageSets(sets []map[uint64]struct{}) map[uint64]struct{} {
 			if _, ok := other[page]; !ok {
 				delete(result, page)
 			}
+		}
+	}
+	return result
+}
+
+// unionPageSets merges the per-round written sets: the arming point is
+// deterministic (the VMM arms right after restoring the snapshot, before any
+// vCPU runs), so a page written in any round is a page the clone's boot
+// writes too, and every round contributes.
+func unionPageSets(sets []map[uint64]struct{}) map[uint64]struct{} {
+	var result map[uint64]struct{}
+	for _, set := range sets {
+		for page := range set {
+			if result == nil {
+				result = make(map[uint64]struct{}, len(set))
+			}
+			result[page] = struct{}{}
 		}
 	}
 	return result
@@ -581,6 +695,26 @@ func checkHotProfileCaps(extents [][2]uint64, totalBytes, memFileSize uint64) er
 	return nil
 }
 
+// checkWrittenProfileCaps validates the written extents the consumer will
+// pre-COW synchronously at restore: totals over 1/writtenPagesMaxTotalDen of
+// the memory volume or extent counts over writtenPagesMaxExtents are
+// refused. Unlike the hotset caps, an empty written set is valid — it just
+// means there is nothing to prewrite.
+func checkWrittenProfileCaps(extents [][2]uint64, totalBytes, memFileSize uint64) error {
+	if totalBytes == 0 {
+		return nil
+	}
+	if totalBytes*writtenPagesMaxTotalDen > memFileSize {
+		return fmt.Errorf("written total %d bytes exceeds 1/%d of memory size %d",
+			totalBytes, writtenPagesMaxTotalDen, memFileSize)
+	}
+	if len(extents) > writtenPagesMaxExtents {
+		return fmt.Errorf("written set has %d extents, over the %d cap",
+			len(extents), writtenPagesMaxExtents)
+	}
+	return nil
+}
+
 // hotPagesFile is the profile schema consumed by hypervisor/vmm hotset.rs.
 type hotPagesFile struct {
 	Version     int         `json:"version"`
@@ -588,21 +722,30 @@ type hotPagesFile struct {
 	MemFileSize uint64      `json:"mem_file_size"`
 	ProfiledAt  string      `json:"profiled_at"`
 	Extents     [][2]uint64 `json:"extents"`
+	// WrittenExtents lists the memory-file ranges the profiled guest wrote
+	// between resume and ready; the VMM pre-COWs them at fast-restore time.
+	WrittenExtents [][2]uint64 `json:"written_extents"`
 }
 
 // writeHotPagesFile atomically writes the profile (temp file + rename) so a
 // consumer never observes a partial file.
-func writeHotPagesFile(path, templateID string, memFileSize uint64, extents [][2]uint64) error {
+func writeHotPagesFile(path, templateID string, memFileSize uint64, extents, writtenExtents [][2]uint64) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create profile dir: %w", err)
 	}
+	// Nil slices would marshal as null, which the consumer's serde Vec
+	// deserializer rejects; always emit a JSON array.
+	if writtenExtents == nil {
+		writtenExtents = [][2]uint64{}
+	}
 	payload, err := json.Marshal(hotPagesFile{
-		Version:     HotPagesVersion,
-		TemplateID:  templateID,
-		MemFileSize: memFileSize,
-		ProfiledAt:  time.Now().UTC().Format(time.RFC3339),
-		Extents:     extents,
+		Version:        HotPagesVersion,
+		TemplateID:     templateID,
+		MemFileSize:    memFileSize,
+		ProfiledAt:     time.Now().UTC().Format(time.RFC3339),
+		Extents:        extents,
+		WrittenExtents: writtenExtents,
 	})
 	if err != nil {
 		return fmt.Errorf("marshal profile: %w", err)

@@ -105,7 +105,7 @@ func pagemapFixture(entries map[uint64]uint64, pages uint64) []byte {
 	return raw
 }
 
-func TestParsePresentPageset(t *testing.T) {
+func TestParsePagesetCollectsPresentAndWritten(t *testing.T) {
 	const pageSize = uint64(4096)
 	mapsData := strings.Join([]string{
 		// mapping A: vaddr pages 1-2, file offset 0
@@ -120,32 +120,71 @@ func TestParsePresentPageset(t *testing.T) {
 	}, "\n")
 
 	entries := map[uint64]uint64{
-		1: 1 << 63,           // present
-		2: 0,                 // swapped out
-		4: 1<<63 | 0x8000000, // present (frame number bits)
-		5: 0,                 // not present
-		6: 1 << 63,           // present
-		7: 1 << 63,           // present
+		1: pagemapPresentBit, // present, never written
+		// read-faulted file page: present + soft-dirty but a shared file
+		// mapping (bit 61 set) — must not leak into the written set
+		2: pagemapPresentBit | pagemapSoftDirtyBit | pagemapFileAnonBit,
+		4: pagemapPresentBit | pagemapSoftDirtyBit, // COWed private copy
+		5: pagemapSwappedBit,                       // swapped out: written before swap
+		6: pagemapPresentBit | pagemapFileAnonBit,  // present file page, never written
+		7: 0,                                       // not resident at all
 	}
 	raw := pagemapFixture(entries, 8)
 	pm := bytes.NewReader(raw)
 
-	pages, err := parsePresentPageset(context.Background(), mapsData, pm, testMemoryDev, pageSize)
+	sets, err := parsePageset(context.Background(), mapsData, pm, testMemoryDev, pageSize)
 	if err != nil {
-		t.Fatalf("parsePresentPageset: %v", err)
+		t.Fatalf("parsePageset: %v", err)
 	}
-	want := map[uint64]struct{}{
+	wantPresent := map[uint64]struct{}{
 		0:  {}, // mapping A: vaddr page 1 present, file offset 0
+		1:  {}, // vaddr page 2 -> file page 1
 		8:  {}, // mapping B: vaddr page 4 present, file offset 0x8000 = page 8
 		10: {}, // vaddr page 6 -> file page 8+2
-		11: {}, // vaddr page 7 -> file page 8+3
 	}
-	if len(pages) != len(want) {
-		t.Fatalf("got %v want %v", pages, want)
+	wantWritten := map[uint64]struct{}{
+		8: {}, // COWed private copy
+		9: {}, // swapped out (vaddr page 5 -> file page 8+1)
+	}
+	if !sets.softDirty {
+		t.Fatal("softDirty: got false, want true")
+	}
+	assertPageSet(t, "present", sets.present, wantPresent)
+	assertPageSet(t, "written", sets.written, wantWritten)
+}
+
+func TestParsePagesetFallsBackToPrivateAnonWithoutSoftDirty(t *testing.T) {
+	const pageSize = uint64(4096)
+	mapsData := "00001000-00005000 rw-p 00000000 08:01 123 " + testMemoryDev + "\n"
+
+	// No entry carries bit 55, as on a kernel without CONFIG_MEM_SOFT_DIRTY.
+	entries := map[uint64]uint64{
+		1: pagemapPresentBit | pagemapFileAnonBit, // read-faulted file page
+		2: pagemapPresentBit,                      // COWed private copy
+		3: pagemapSwappedBit,                      // swapped out
+		4: 0,                                      // not resident
+	}
+	pm := bytes.NewReader(pagemapFixture(entries, 5))
+
+	sets, err := parsePageset(context.Background(), mapsData, pm, testMemoryDev, pageSize)
+	if err != nil {
+		t.Fatalf("parsePageset: %v", err)
+	}
+	if sets.softDirty {
+		t.Fatal("softDirty: got true, want false")
+	}
+	assertPageSet(t, "present", sets.present, map[uint64]struct{}{0: {}, 1: {}})
+	assertPageSet(t, "written", sets.written, map[uint64]struct{}{1: {}, 2: {}})
+}
+
+func assertPageSet(t *testing.T, name string, got, want map[uint64]struct{}) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("%s: got %v want %v", name, got, want)
 	}
 	for page := range want {
-		if _, ok := pages[page]; !ok {
-			t.Fatalf("missing page %d in %v", page, pages)
+		if _, ok := got[page]; !ok {
+			t.Fatalf("%s: missing page %d in %v", name, page, got)
 		}
 	}
 }
@@ -169,6 +208,25 @@ func TestIntersectPageSets(t *testing.T) {
 	}
 	if got := intersectPageSets(nil); got != nil {
 		t.Fatalf("nil input should give nil")
+	}
+}
+
+func TestUnionPageSets(t *testing.T) {
+	got := unionPageSets([]map[uint64]struct{}{
+		{1: {}, 2: {}},
+		nil,
+		{2: {}, 3: {}},
+	})
+	if len(got) != 3 {
+		t.Fatalf("expected {1,2,3}, got %v", got)
+	}
+	for _, page := range []uint64{1, 2, 3} {
+		if _, ok := got[page]; !ok {
+			t.Fatalf("missing %d: %v", page, got)
+		}
+	}
+	if got := unionPageSets(nil); got != nil {
+		t.Fatalf("nil input should give nil, got %v", got)
 	}
 }
 
@@ -252,13 +310,56 @@ func TestCheckHotProfileCaps(t *testing.T) {
 	}
 }
 
+// ---- written-set caps ----
+
+func TestCheckWrittenProfileCaps(t *testing.T) {
+	const pageSize = uint64(4096)
+	memSize := uint64(1) << 30 // 1GiB memory volume; written cap is 1/8 = 128MiB
+
+	// empty written set is valid: nothing to prewrite
+	if err := checkWrittenProfileCaps(nil, 0, memSize); err != nil {
+		t.Fatalf("empty written set rejected: %v", err)
+	}
+
+	// well-formed small set passes
+	if err := checkWrittenProfileCaps([][2]uint64{{0, 64 * pageSize}}, 64*pageSize, memSize); err != nil {
+		t.Fatalf("small written set rejected: %v", err)
+	}
+
+	// total over the 1/writtenPagesMaxTotalDen share of the volume
+	if err := checkWrittenProfileCaps([][2]uint64{{0, memSize}}, memSize, memSize); err == nil {
+		t.Fatal("over-total written set accepted")
+	}
+	// exactly 1/8 passes
+	atTotal := memSize / writtenPagesMaxTotalDen
+	if err := checkWrittenProfileCaps([][2]uint64{{0, atTotal}}, atTotal, memSize); err != nil {
+		t.Fatalf("at-total written set rejected: %v", err)
+	}
+
+	// extent count over the cap: writtenPagesMaxExtents+1 one-page extents
+	over := make([][2]uint64, writtenPagesMaxExtents+1)
+	var total uint64
+	for i := range over {
+		over[i] = [2]uint64{uint64(i) * 8 * pageSize, pageSize}
+		total += pageSize
+	}
+	if err := checkWrittenProfileCaps(over, total, memSize); err == nil {
+		t.Fatal("over-count written set accepted")
+	}
+	// exactly at the cap is fine
+	if err := checkWrittenProfileCaps(over[:writtenPagesMaxExtents], total-pageSize, memSize); err != nil {
+		t.Fatalf("at-cap written set rejected: %v", err)
+	}
+}
+
 // ---- profile file ----
 
 func TestWriteHotPagesFileAtomicAndReadable(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "snapshot", HotPagesFileName)
 	extents := [][2]uint64{{0, 4096}, {8192, 4096}}
-	if err := writeHotPagesFile(path, "tpl-x", 1<<20, extents); err != nil {
+	writtenExtents := [][2]uint64{{4096, 8192}}
+	if err := writeHotPagesFile(path, "tpl-x", 1<<20, extents, writtenExtents); err != nil {
 		t.Fatalf("writeHotPagesFile: %v", err)
 	}
 	data, err := os.ReadFile(path)
@@ -275,12 +376,32 @@ func TestWriteHotPagesFileAtomicAndReadable(t *testing.T) {
 	if len(parsed.Extents) != 2 || parsed.Extents[0] != [2]uint64{0, 4096} {
 		t.Fatalf("unexpected extents: %v", parsed.Extents)
 	}
+	if len(parsed.WrittenExtents) != 1 || parsed.WrittenExtents[0] != [2]uint64{4096, 8192} {
+		t.Fatalf("unexpected written extents: %v", parsed.WrittenExtents)
+	}
 	// no temp files left behind
 	entries, _ := os.ReadDir(filepath.Dir(path))
 	for _, e := range entries {
 		if strings.Contains(e.Name(), ".tmp-") {
 			t.Fatalf("temp file left behind: %s", e.Name())
 		}
+	}
+}
+
+func TestWriteHotPagesFileNilWrittenIsArray(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, HotPagesFileName)
+	if err := writeHotPagesFile(path, "tpl-x", 1<<20, [][2]uint64{{0, 4096}}, nil); err != nil {
+		t.Fatalf("writeHotPagesFile: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	// the consumer's serde Vec deserializer rejects null; the field must be
+	// emitted as an empty JSON array
+	if !strings.Contains(string(data), `"written_extents":[]`) {
+		t.Fatalf("written_extents must marshal as [], got: %s", data)
 	}
 }
 
